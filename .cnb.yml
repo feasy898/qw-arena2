@@ -60,7 +60,4 @@ main:
             docker compose run --rm agent python /workspace/agent.py --version
         - name: full-mock-run
           script: |
-            cd /tmp/official && docker compose run --rm agent python /workspace/agent.py --prompt "请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output"
-            echo "--- 输出产物 ---"
-            ls -la output/
-            for f in output/*.md; do echo "== $f =="; head -3 "$f"; done
+            cd /tmp/official && docker compose run --rm agent sh -c "python /workspace/agent.py --prompt '请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output' && echo '--- 输出产物 ---' && ls -la /home/user/ws/output/ && for f in /home/user/ws/output/*.md; do echo \"== \$f ==\"; head -3 \"\$f\"; done && echo '--- agent.log 尾部 ---' && tail -10 /home/user/ws/logs/agent.log"

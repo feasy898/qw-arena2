@@ -31,11 +31,6 @@ services:
       - DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/api/v1}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       - AGENT_LOG_DIR=/home/user/ws/logs
-    volumes:
-      - ${AGENT_DIR:-./agent}:/workspace:ro
-      - ${INPUT_DIR:-./input}:/home/user/ws/input:ro
-      - ${OUTPUT_DIR:-./output}:/home/user/ws/output:rw
-      - ${AGENT_LOG_DIR:-./logs}:/home/user/ws/logs:rw
     working_dir: /workspace
     depends_on:
       - proxy

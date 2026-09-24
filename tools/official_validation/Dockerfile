@@ -18,4 +18,9 @@ RUN wget -q "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-amd64.tar.g
     && tar -C /usr/local -xzf /tmp/go.tar.gz && rm /tmp/go.tar.gz \
     && ln -sf /usr/local/go/bin/go /usr/local/bin/go
 
+# CNB 的 docker daemon 与流水线容器不在同一文件系统，bind mount 拿不到
+# 构建产物目录——改为构建期复制（对 Python 运行时行为与官方挂载方式等价）。
+COPY agent/ /workspace/
+COPY input/ /home/user/ws/input/
+
 WORKDIR /workspace
