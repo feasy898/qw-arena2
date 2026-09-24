@@ -60,4 +60,19 @@ main:
             docker compose run --rm agent python /workspace/agent.py --version
         - name: full-mock-run
           script: |
-            cd /tmp/official && docker compose run --rm agent sh -c "python /workspace/agent.py --prompt '请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output' && echo '--- 输出产物 ---' && ls -la /home/user/ws/output/ && for f in /home/user/ws/output/*.md; do echo \"== \$f ==\"; head -3 \"\$f\"; done && echo '--- agent.log 尾部 ---' && tail -10 /home/user/ws/logs/agent.log"
+            cd /tmp/official
+            # 正式评测形态：输入目录恰含 1 份用户描述（示例包 6 份是六个独立评测包，取用户 1）
+            rm -rf input_u1 && mkdir -p input_u1
+            cp input/Ecommerce_Listing_Snapshot.csv input_u1/ 2>/dev/null || cp input/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv input_u1/
+            cp input/User_Description_1.txt input_u1/ 2>/dev/null || cp input/00_User_Descriptions/User_Description_1.txt input_u1/
+            mkdir -p input_u1/01_Ecommerce_Listings input_u1/00_User_Descriptions input_u1/02_Media_Coverage_and_Reviews input_u1/03_User_Feedback_and_Complaints input_u1/04_Brand_Official_Sites
+            cp input/00_User_Descriptions/User_Description_1.txt input_u1/00_User_Descriptions/ || true
+            cp input/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv input_u1/01_Ecommerce_Listings/ || true
+            cp input/02_Media_Coverage_and_Reviews/* input_u1/02_Media_Coverage_and_Reviews/ || true
+            cp input/03_User_Feedback_and_Complaints/* input_u1/03_User_Feedback_and_Complaints/ || true
+            cp input/04_Brand_Official_Sites/* input_u1/04_Brand_Official_Sites/ || true
+            ls -R input_u1 | head -20
+            # 用单用户目录重建镜像层（COPY input/ 指向的目录内容替换）
+            rm -rf input && mv input_u1 input
+            docker compose build agent 2>&1 | tail -2
+            docker compose run --rm agent sh -c "python /workspace/agent.py --prompt '请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output' && echo '--- 输出产物 ---' && ls -la /home/user/ws/output/ && for f in /home/user/ws/output/*.md; do echo \"== \$f ==\"; head -3 \"\$f\"; done && echo '--- agent.log 尾部 ---' && tail -10 /home/user/ws/logs/agent.log"
