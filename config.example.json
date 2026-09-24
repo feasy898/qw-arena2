@@ -1,0 +1,26 @@
+{
+  "version": "0.1.0",
+  "comment": "复制为 config.json 后按需覆盖；所有键见 src/pipeline.resolve_config；未知键报错。密钥一律不进本文件（只从环境变量读）。",
+  "default_model": "qwen3.7-max",
+  "fallback_models": ["qwen3.6-flash", "glm-5.2", "deepseek-v4-flash"],
+  "api_mode": "openai_compatible",
+  "concurrency": 2,
+  "max_retries_per_request": 2,
+  "max_repair_loops": 2,
+  "time_limits": {
+    "hard_seconds": 1800,
+    "soft_seconds": 1680
+  },
+  "memory_limit_gb": 4,
+  "mock": {
+    "enabled": false,
+    "force_env": "QW_FORCE_MOCK",
+    "fixture_path": "tests/fixtures/gateway/responses.json"
+  },
+  "log": {
+    "dir_env": "AGENT_LOG_DIR",
+    "local_default_dir": "reports/logs",
+    "file_name": "agent.log"
+  },
+  "output_files": ["user_profile.md", "product_list.md", "recommendation.md"]
+}

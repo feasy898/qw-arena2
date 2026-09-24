@@ -1,0 +1,21 @@
+# 密钥与本地敏感文件
+.secrets/
+*.cab
+__pycache__/
+*.pyc
+
+# 本地运行产物与抓取资料（推送到 CNB 的只有验证所需最小集合）
+dist/
+reports/
+logs/
+raw/pages/
+raw/*.txt
+raw/*.js
+raw/*.html
+raw/*.zip
+raw/*.png
+tools/qwsession.py
+tools/decrypt_edge_cookies.py
+tools/cdp_fetch.py
+tools/e2e_real.py
+tools/benchmark.py
