@@ -54,6 +54,9 @@ COPY_ITEMS: list[tuple[str, str]] = [
     ("src", "src"),
     ("prompts", "prompts"),
     ("contracts", "contracts"),
+    # mock 网关夹具：官方本地校验工具在无 Key/QW_FORCE_MOCK 下运行时必需
+    # （gateway 以 cwd 相对路径 tests/fixtures/gateway/responses.json 解析）
+    ("tests/fixtures/gateway/responses.json", "tests/fixtures/gateway/responses.json"),
 ]
 # 目录复制时跳过的条目名 / 文件后缀
 EXCLUDE_DIR_NAMES = {"__pycache__", ".pytest_cache", ".git"}
