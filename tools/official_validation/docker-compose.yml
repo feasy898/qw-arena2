@@ -1,0 +1,49 @@
+services:
+  proxy:
+    image: ubuntu/squid:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /etc/squid/squid.conf <<'SQUID'
+        http_port 3128
+        acl whitelist dstdomain .aliyuncs.com
+        acl SSL_ports port 443
+        acl CONNECT method CONNECT
+        http_access allow CONNECT SSL_ports whitelist
+        http_access deny all
+        cache deny all
+        SQUID
+        squid -N -f /etc/squid/squid.conf
+    networks:
+      intranet:
+      internet:
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    environment:
+      - HTTPS_PROXY=http://proxy:3128
+      - HTTP_PROXY=http://proxy:3128
+      - QW_FORCE_MOCK=${QW_FORCE_MOCK:-1}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-mock}
+      - DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/api/v1}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - AGENT_LOG_DIR=/home/user/ws/logs
+    volumes:
+      - ${AGENT_DIR:-./agent}:/workspace:ro
+      - ${INPUT_DIR:-./input}:/home/user/ws/input:ro
+      - ${OUTPUT_DIR:-./output}:/home/user/ws/output:rw
+      - ${AGENT_LOG_DIR:-./logs}:/home/user/ws/logs:rw
+    working_dir: /workspace
+    depends_on:
+      - proxy
+    networks:
+      intranet:
+
+networks:
+  intranet:
+    internal: true
+  internet:
+    driver: bridge
