@@ -1,0 +1,924 @@
+{
+  "version": "0.1.0",
+  "purpose": "user_profile.md 与 product_list.md 的唯一字段口径：同字段集、同顺序、同表头、同缺失表达。渲染器与解析器、画像/产品抽取 Prompt、validators 均以本目录为准。",
+  "sources_of_truth": [
+    "raw/competition-problemData.txt（输出要求：画像7字段组 / 产品5字段组；评分维度 U1-U4 / P1-P6 / R1-R4）",
+    "SPEC.md §4/§6/§7/§8/§9/§10",
+    "raw/dataset_sample/Data_for_Users/（逐文件核对，见 meta.verified_against）"
+  ],
+  "common": {
+    "table_columns": ["字段组", "字段名", "取值"],
+    "types": {
+      "文本": "自由文本，保留原文限定词（约/最长/最高等）",
+      "数字": "纯数值，可带小数；单位由 unit 列约束，写在取值中时保留原单位表述",
+      "区间": "下限-上限（如 699-999）；允许退化为单值（须注明口径，如「展示价1098元」）",
+      "枚举": "取值限于 enum 列表",
+      "列表": "多个原子项；结构化列表按 item_fields 逐项展开为独立表格行"
+    },
+    "missing_values": {
+      "未提供": "输入资料对该子字段完全无信息",
+      "待核验": "资料有相关表述但无统一口径，或仅宣传性/待证实表述；须附简短条件说明"
+    },
+    "missing_selection_rule": "先判「未提供」（资料完全无信息）；仅当资料存在相关表述但不满足采信条件时用「待核验」。二者不得混用、不得用 N/A、-、空串等替代。",
+    "row_policy": "同一文档内所有行的字段名与顺序完全一致（官方要求所有产品表格结构完全一致）。required=false 仅表示该值允许为缺失表达，不表示可省略表格行。",
+    "verbatim_rule": "品牌与型号原样沿用脱敏名，不替换、不简写、不还原；数字保留原文精度与「约/最长」等限定词。",
+    "citation_format": {
+      "profile": "画像｜{字段组}｜{字段名}",
+      "product": "产品属性｜{产品编号}｜{字段名}",
+      "scope": "recommendation.md 中的引用只允许指向前两份文档内出现的字段，不得越界引用原始资料"
+    }
+  },
+  "profile": {
+    "document": "user_profile.md",
+    "table_columns": ["字段组", "字段名", "取值"],
+    "groups": [
+      {
+        "name": "标识",
+        "scoring": ["U4"],
+        "fields": [
+          {
+            "key": "profile_id",
+            "name": "画像编号",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "取输入文件名编号：User_Description_{n}（n 为文件名中的数字）",
+            "scoring": ["U4"]
+          }
+        ]
+      },
+      {
+        "name": "基本情况",
+        "scoring": ["U1", "U3", "U4"],
+        "fields": [
+          {
+            "key": "name",
+            "name": "称谓",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "原文称谓原样（如「小王」「陈女士」）",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "gender",
+            "name": "性别",
+            "type": "枚举",
+            "enum": ["男", "女", "未提供"],
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "scoring": ["U1"]
+          },
+          {
+            "key": "age",
+            "name": "年龄",
+            "type": "数字",
+            "unit": "岁",
+            "missing": "未提供",
+            "required": true,
+            "scoring": ["U1"]
+          },
+          {
+            "key": "occupation",
+            "name": "职业",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "不作上位概念简化，保留原文表述（如「大二学生」不写「学生」）",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "city",
+            "name": "所在城市/地区",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "scoring": ["U1"]
+          }
+        ]
+      },
+      {
+        "name": "购买目标",
+        "scoring": ["U1", "U4"],
+        "fields": [
+          {
+            "key": "product_category",
+            "name": "商品品类",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原文品类词（如「耳机」），不做上位/下位改写",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "desired_product_type",
+            "name": "期望产品类型/形态",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "原文明确的具体类型（如「头戴式游戏耳机」「能在水下听歌的耳机」）",
+            "scoring": ["U1", "R1"]
+          },
+          {
+            "key": "purchase_purposes",
+            "name": "购买目的",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原子化逐条列出，每条可独立核验；禁止概括成标签（如「重度通勤用户」）",
+            "scoring": ["U1"]
+          }
+        ]
+      },
+      {
+        "name": "预算",
+        "scoring": ["U1", "R1"],
+        "fields": [
+          {
+            "key": "budget_min",
+            "name": "预算下限",
+            "type": "数字",
+            "unit": "元",
+            "missing": "未提供",
+            "required": false,
+            "scoring": ["U1"]
+          },
+          {
+            "key": "budget_max",
+            "name": "预算上限",
+            "type": "数字",
+            "unit": "元",
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "「约X左右」时仍取 X 为数值，口径记入 budget_semantics，不得直接当硬上限",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "currency",
+            "name": "币种",
+            "type": "枚举",
+            "enum": ["元", "未提供"],
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原文以「元」计价时记「元」；原文未提币种时「未提供」，不得按常识补 CNY",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "budget_raw",
+            "name": "预算原文表述",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "逐字保留（如「预算2000元左右」「大概在1500-2000元之间」），供溯源",
+            "scoring": ["U3", "P3"]
+          },
+          {
+            "key": "budget_semantics",
+            "name": "预算口径",
+            "type": "枚举",
+            "enum": ["区间", "约(单值)", "上限", "未明确"],
+            "unit": null,
+            "missing": "未明确",
+            "required": true,
+            "value_rule": "决定硬约束准入：约(单值)不得直接变成硬上限（SPEC §6）",
+            "scoring": ["R1"]
+          }
+        ]
+      },
+      {
+        "name": "设备",
+        "scoring": ["U1", "U4"],
+        "fields": [
+          {
+            "key": "devices",
+            "name": "现有主要设备",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "逐台/逐类原样列出（如「Velmora 手机」「禾岚 安卓手机」），保留品牌脱敏名",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "ecosystem",
+            "name": "系统生态",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原文生态表述（如「安卓」「Velmora 封闭系统生态」）",
+            "scoring": ["U1"]
+          },
+          {
+            "key": "ecosystem_notes",
+            "name": "生态备注",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "设备切换、双生态并存等原文信息（如「之前用 Velmora，最近换成安卓禾岚」）",
+            "scoring": ["U3"]
+          }
+        ]
+      },
+      {
+        "name": "场景",
+        "scoring": ["U1", "U4", "R1"],
+        "fields": [
+          {
+            "key": "scenes",
+            "name": "场景",
+            "type": "列表",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "结构化列表，每个场景为一组原子项；渲染为 场景{n}·名称/时长/频率/优先级/判定依据 行，按优先级从高到低排序",
+            "item_fields": [
+              {
+                "key": "scene_name",
+                "name": "场景{n}·名称",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": true,
+                "value_rule": "场景名称取原文（如「地铁通勤」「游泳」「打游戏」）",
+                "scoring": ["U1"]
+              },
+              {
+                "key": "usage_duration",
+                "name": "场景{n}·使用时长",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": false,
+                "value_rule": "数字+单位（如「单程40分钟」「每次1小时左右」）；缺失写「未提供」，不常识补全",
+                "scoring": ["U1"]
+              },
+              {
+                "key": "usage_frequency",
+                "name": "场景{n}·使用频率",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": false,
+                "value_rule": "如「每天」「每周3-4次」「周末」；缺失写「未提供」",
+                "scoring": ["U1"]
+              },
+              {
+                "key": "scene_priority",
+                "name": "场景{n}·优先级",
+                "type": "数字",
+                "unit": null,
+                "missing": "优先级未明确",
+                "required": true,
+                "value_rule": "整数，1=最高；无法排序时写「优先级未明确」",
+                "scoring": ["U1", "R1"]
+              },
+              {
+                "key": "priority_basis",
+                "name": "场景{n}·优先级判定依据",
+                "type": "枚举",
+                "enum": ["原文明示排序", "原文主次措辞", "优先级未明确"],
+                "unit": null,
+                "missing": "优先级未明确",
+                "required": true,
+                "value_rule": "判定顺序：原文明示排序 > 原文主次措辞（主要/其次/偶尔/平时也会/核心）> 标「优先级未明确」（SPEC §6）",
+                "scoring": ["U1"]
+              },
+              {
+                "key": "scene_evidence",
+                "name": "场景{n}·原文依据",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": true,
+                "value_rule": "支持该场景的原文片段（逐字），供 U3 幻觉抑制核查",
+                "scoring": ["U3", "P3"]
+              }
+            ],
+            "scoring": ["U1", "U4", "R1"]
+          }
+        ]
+      },
+      {
+        "name": "偏好",
+        "scoring": ["U2", "U3"],
+        "fields": [
+          {
+            "key": "brand_preferences",
+            "name": "品牌倾向",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "只收原文明确表达（如「偏好 Tasvin、Norvek」），逐品牌列出",
+            "scoring": ["U2"]
+          },
+          {
+            "key": "brand_avoidances",
+            "name": "品牌排斥",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "scoring": ["U2"]
+          },
+          {
+            "key": "appearance_preferences",
+            "name": "外观诉求",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "逐项列出（如「浅色系」「好看的设计」），不得笼统合并",
+            "scoring": ["U2"]
+          },
+          {
+            "key": "sound_preferences",
+            "name": "声音与听感偏好",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「对音质有一定要求」「不喜欢太轰头的低音」",
+            "scoring": ["U2"]
+          },
+          {
+            "key": "functional_preferences",
+            "name": "功能与性能诉求",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "原文明确的功能诉求（如「需要降噪功能」「防水要好」「最好自带存储」「和安卓手机配合得好」「麦克风清晰」「听声辨位精准」）",
+            "scoring": ["U2", "R1"]
+          },
+          {
+            "key": "service_preferences",
+            "name": "服务要求",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "只收原文说过的服务要求（保修/售后/客服等）",
+            "scoring": ["U2"]
+          },
+          {
+            "key": "other_preferences",
+            "name": "其他明确偏好",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "原文明确但不适配上述子字段的偏好（如「希望性价比高一些」「希望能耐用一些」「对产品专业性要求高」「对品牌没有特别要求」）",
+            "scoring": ["U2"]
+          }
+        ]
+      }
+    ]
+  },
+  "product": {
+    "document": "product_list.md",
+    "table_columns": ["字段组", "字段名", "取值"],
+    "section_title": "产品编号+产品名称（如「P001 Ralun Pro」）；全部产品逐款成节，节顺序按 canonical_id 升序",
+    "groups": [
+      {
+        "name": "基础标识",
+        "scoring": ["P1", "P5"],
+        "fields": [
+          {
+            "key": "canonical_id",
+            "name": "产品编号",
+            "type": "文本",
+            "unit": null,
+            "missing": null,
+            "required": true,
+            "value_rule": "三位规范形 P###（编号归一见 contracts/rules.json）；须与 recommendation.md 的产品ID完全一致",
+            "scoring": ["P1", "R2"]
+          },
+          {
+            "key": "aliases",
+            "name": "编号别名",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "保留全部原始写法（如「P01」）",
+            "scoring": ["P1"]
+          },
+          {
+            "key": "product_name",
+            "name": "产品名称",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "不带品牌前缀（与 recommendation.md「产品」列一致），如「Ralun Pro」「VD-140」",
+            "scoring": ["P1", "R4"]
+          },
+          {
+            "key": "brand",
+            "name": "品牌",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "脱敏名原样沿用",
+            "scoring": ["P1"]
+          },
+          {
+            "key": "model",
+            "name": "型号",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原样沿用；货架型号列与官网型号块写法可能不同，以官网型号为主值，差异在取值中并列登记",
+            "scoring": ["P1"]
+          },
+          {
+            "key": "category",
+            "name": "产品类别/形态",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "如「骨传导游泳耳机」「颈挂式游泳播放器耳机」",
+            "scoring": ["P1", "P2"]
+          },
+          {
+            "key": "core_functions",
+            "name": "核心功能",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "官网【型号】块核心功能逐项（如「Vondir 2.0+骨传导」「游泳EQ」「32GB本地存储」）",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "generation",
+            "name": "产品代际",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "原样（如「2024款 / Ralun Pro」「第7代技术 / 原Ralun 初版」「2017款」「Sorbik Pro第5代」）；相近型号必须分开处理",
+            "scoring": ["P1"]
+          },
+          {
+            "key": "variants",
+            "name": "颜色/套餐",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "货架快照颜色/套餐列逐项",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "channel_and_shop",
+            "name": "平台与店铺类型",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "货架快照平台+店铺类型（如「电商平台甲 平台自营旗舰店」），价格与热度口径的一部分",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "listing_title",
+            "name": "商品标题（货架）",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "货架快照商品标题原样，供节标题与名称溯源",
+            "scoring": ["P3"]
+          }
+        ]
+      },
+      {
+        "name": "产品力",
+        "scoring": ["P2", "P3", "P4", "P5"],
+        "fields": [
+          {
+            "key": "noise_cancellation",
+            "name": "降噪能力",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "区分「无主动降噪」「环境降噪/环境声模式」；宣传性降噪表述不得当事实",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "call_capability",
+            "name": "通话能力",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「陆上通话支持环境降噪，水下使用不以降噪为核心」；适用条件一并写明",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "acoustic_tech",
+            "name": "声学技术",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「Vondir 2.0+骨传导」；厂商技术说明属宣传表述时按 fact_kind=宣传表述登记",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "local_storage_gb",
+            "name": "本地存储容量",
+            "type": "数字",
+            "unit": "GB",
+            "missing": "未提供",
+            "required": true,
+            "scoring": ["P2"]
+          },
+          {
+            "key": "audio_formats",
+            "name": "支持音频格式",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "逐格式列出；「部分详细格式待核验」时整体记待核验",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "bluetooth",
+            "name": "蓝牙能力",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "支持与否+版本；版本仅见渠道宣称时标注（如「蓝牙5.4（渠道宣称，待核验）」）",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "bluetooth_underwater",
+            "name": "蓝牙水下可用性",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "水下能否用蓝牙须按冲突三步法处理（如 P01 渠道宣称可水下串流 vs 第三方实测「水下只能使用MP3模式」→并列保留并标待核验）",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "battery_by_mode",
+            "name": "续航（分模式）",
+            "type": "列表",
+            "unit": null,
+            "missing": "待核验",
+            "required": true,
+            "value_rule": "结构化列表，逐模式一行；不同模式并列保留，禁止取平均、禁止合并成单一数字",
+            "item_fields": [
+              {
+                "key": "mode",
+                "name": "续航{n}·模式",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": true,
+                "value_rule": "如「蓝牙模式」「MP3模式」「内存模式」「未区分模式」",
+                "scoring": ["P2"]
+              },
+              {
+                "key": "duration",
+                "name": "续航{n}·时长",
+                "type": "文本",
+                "unit": "小时",
+                "missing": "未提供",
+                "required": true,
+                "value_rule": "保留「最长/约」限定词",
+                "scoring": ["P2"]
+              },
+              {
+                "key": "conditions",
+                "name": "续航{n}·条件",
+                "type": "文本",
+                "unit": null,
+                "missing": "未提供",
+                "required": false,
+                "value_rule": "测试条件/口径/来源类型；官方未披露统一口径时整体记待核验",
+                "scoring": ["P4", "P5"]
+              }
+            ],
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "charging",
+            "name": "充电",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "充电时长与快充能力（如「10分钟快充约3小时」「快充3分钟约60分钟播放」）",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "wearing_design",
+            "name": "佩戴方式与结构",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「颈后式开放佩戴」「35°可调结构」「入耳式便携播放器系列」",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "weight_g",
+            "name": "重量",
+            "type": "数字",
+            "unit": "g",
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "保留「约」限定词于取值文本",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "protection_rating",
+            "name": "防护等级",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "如「IP68」「IPX8」「IP65/IP68」原样",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "waterproof_conditions",
+            "name": "防水适用条件",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "水深/时长/水质/耳塞条件逐条（如「官方声明淡水2米内最长2小时」「使用游泳耳塞时可在淡水/海水约2米内30分钟」「具体条件须查说明书」）；不以IP等级自行外推",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "accessories_fit",
+            "name": "配件适配",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「适配泳帽和泳镜」「含游泳耳塞」",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "special_features",
+            "name": "特色功能",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「游泳EQ」「MP3与Larvo离线模式」「支持环境声模式」「陆上支持NFC」「物理按键可盲操」",
+            "scoring": ["P2"]
+          }
+        ]
+      },
+      {
+        "name": "品牌力",
+        "scoring": ["P2", "P3"],
+        "fields": [
+          {
+            "key": "brand_origin_market",
+            "name": "品牌归属与市场",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "官网【品牌概况】归属与市场（如「海外音频品牌，产品在北美、欧洲与亚洲多个市场同步销售」）",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "brand_category_focus",
+            "name": "品类积累与专业度",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "官网【品牌概况】品类积累（如「成立以来只做骨传导与开放式运动音频…声学专利自研多代」）",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "brand_reputation",
+            "name": "品牌名气口碑",
+            "type": "文本",
+            "unit": null,
+            "missing": "待核验",
+            "required": false,
+            "value_rule": "资料仅见宣传性名气表述（如「全球游泳耳机销量第一」）时记待核验并登记到 marketing_claims；无任何表述记「未提供」",
+            "scoring": ["P2", "P4"]
+          }
+        ]
+      },
+      {
+        "name": "市场验证",
+        "scoring": ["P6", "P4"],
+        "fields": [
+          {
+            "key": "sales_volume",
+            "name": "市场热度（销量）",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "只用资料可见销量（货架「已售/付款人数」，如「已售25」「已售2000+」）；渠道宣称销量（如「5万名买家」）不作为热度依据，登记到 marketing_claims",
+            "scoring": ["P6"]
+          },
+          {
+            "key": "user_rating",
+            "name": "用户综合评分",
+            "type": "文本",
+            "unit": null,
+            "missing": "待核验",
+            "required": false,
+            "value_rule": "资料未提供分值时标待核验（可说明折算方式）；渠道宣称评分（如「评分5.0」）不作事实",
+            "scoring": ["P6"]
+          },
+          {
+            "key": "common_praise",
+            "name": "共性好评点",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "须能回溯反馈/实测原文；按 contracts/rules.json 表达层级注明条数与样本范围；条目不足不得称共性",
+            "scoring": ["P6"]
+          },
+          {
+            "key": "common_complaints",
+            "name": "共性槽点",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "同上；不得从规格参数反推用户未提及的槽点",
+            "scoring": ["P6"]
+          },
+          {
+            "key": "feedback_sample_note",
+            "name": "反馈样本与代表性说明",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "说明摘录条数、独立性、样本范围与「代表性未知」边界（SPEC §8 表达层级）",
+            "scoring": ["P6"]
+          },
+          {
+            "key": "marketing_claims",
+            "name": "渠道宣传与促销表述（不作为事实）",
+            "type": "列表",
+            "item_type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "逐条登记原文宣称（如「蓝牙5.4可在水下2米稳定串流」「单次续航18小时」「2026年新上市爆款，已有5万名国内买家评分5.0」「权威机构认证全球销量第一」「Ralun与Ralun Pro配置相同」），标注出处；与可靠来源冲突时按冲突三步法在对应能力字段并列保留",
+            "scoring": ["P4", "P6"]
+          }
+        ]
+      },
+      {
+        "name": "购买与使用成本",
+        "scoring": ["P2", "P4"],
+        "fields": [
+          {
+            "key": "current_price",
+            "name": "当前售价",
+            "type": "区间",
+            "unit": "元",
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "区间（如「699-999」）或单值（须注口径，如「展示价1098（平台自营旗舰店）」）；多口径并列保留并注渠道/快照时间",
+            "scoring": ["P2", "P4"]
+          },
+          {
+            "key": "original_price",
+            "name": "优惠前价格",
+            "type": "数字",
+            "unit": "元",
+            "missing": "未提供",
+            "required": false,
+            "scoring": ["P2"]
+          },
+          {
+            "key": "price_trend",
+            "name": "价格趋势",
+            "type": "文本",
+            "unit": null,
+            "missing": "待核验",
+            "required": false,
+            "value_rule": "只在资料内可见事实（展示价 vs 优惠前价 vs 渠道报价区间）上作有界表述并标不确定性；无据则「未提供」；禁止预测「以后可能降价」",
+            "scoring": ["P4"]
+          },
+          {
+            "key": "warranty",
+            "name": "保修",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": true,
+            "value_rule": "官网保修+地区政策限定（如「24个月（以销售地区政策为准）」「12个月；登记活动可能延长，须以地区政策为准」）",
+            "scoring": ["P2"]
+          },
+          {
+            "key": "after_sales",
+            "name": "购买渠道与售后可得性",
+            "type": "文本",
+            "unit": null,
+            "missing": "未提供",
+            "required": false,
+            "value_rule": "如「国内购买和售后不便」（第三方实测）；店铺类型辅助说明",
+            "scoring": ["P2", "P6"]
+          },
+          {
+            "key": "ongoing_costs",
+            "name": "配件与维修持续成本",
+            "type": "文本",
+            "unit": null,
+            "missing": "待核验",
+            "required": false,
+            "value_rule": "资料有相关线索（如「磁吸充电线需单独保管」）时如实登记并标边界；完全无信息记「未提供」",
+            "scoring": ["P4"]
+          }
+        ]
+      }
+    ]
+  },
+  "recommendation": {
+    "document": "recommendation.md",
+    "sections": [
+      {
+        "name": "推荐结果",
+        "table_columns": ["推荐层级", "产品ID", "产品", "画像匹配与推荐理由", "注意事项"],
+        "constraints": [
+          "恰好 3 行：首选/备选1/备选2，行序即优先次序；有效产品不足 3 款时按 SPEC §9 异常路径处理（不虚构、不放宽，空位明确说明）",
+          "产品ID 与 product_list.md 的产品编号完全一致",
+          "产品名称与 product_list.md 一致，不带品牌前缀",
+          "画像匹配与推荐理由须同时点明命中画像哪项需求+支撑判断的具体产品属性（引用格式见 common.citation_format）",
+          "注意事项不得留空：使用限制/代价+购买前需确认核验事项",
+          "表后附一句综合结论：不同偏好取向下如何在 3 款之间取舍"
+        ]
+      },
+      {
+        "name": "未选原因",
+        "table_columns": ["产品ID", "未进入前三的主要原因", "建议改变条件"],
+        "constraints": [
+          "覆盖全部未入选产品，不得遗漏；原因相同的可合并为一行",
+          "主要原因须落到 product_list.md 具体字段，指明与硬约束或核心场景的冲突点",
+          "建议改变条件写成条件句，且须与排除原因对应；多个否决条件不得只解决其一",
+          "禁止预测「以后可能降价」类无据变化"
+        ]
+      }
+    ],
+    "exclusion_reason_categories": ["硬约束不符", "硬约束证据不足", "软需求匹配弱", "同条件下被压过", "无足够新增价值"]
+  },
+  "meta": {
+    "created": "2026-09-23",
+    "verified_against": [
+      "raw/dataset_sample/Data_for_Users/00_User_Descriptions/User_Description_{1..6}.txt（6 用户全部子字段可承载）",
+      "raw/dataset_sample/Data_for_Users/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv（7 列全部映射）",
+      "raw/dataset_sample/Data_for_Users/02_Media_Coverage_and_Reviews/（P01-P05 报道+实测全部事实类型可承载）",
+      "raw/dataset_sample/Data_for_Users/03_User_Feedback_and_Complaints/User_Feedback_Excerpts.csv（3 条反馈可承载）",
+      "raw/dataset_sample/Data_for_Users/04_Brand_Official_Sites/（P001-P005 品牌概况+型号块全部参数可承载）"
+    ],
+    "extension_policy": "扩展字段仅在确认不影响解析时加，且对所有产品统一加（SPEC §10）；新增子字段须同步本目录并在 reports/progress.md 登记"
+  }
+}
