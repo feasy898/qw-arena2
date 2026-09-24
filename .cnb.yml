@@ -22,8 +22,9 @@ main:
           script: python tools/e2e_mock_packaged.py
         - name: zip-fresh-run
           script: |
-            cd /tmp && rm -rf zipcheck && mkdir zipcheck && cd zipcheck
-            python -m zipfile -e "$OLDPWD/dist/agent.zip" .
+            rm -rf /tmp/zipcheck && mkdir -p /tmp/zipcheck && cd /tmp/zipcheck
+            python -m zipfile -e "${CNB_BUILD_WORKSPACE}/dist/agent.zip" .
+            ls agent/ | head -5
             python agent/agent.py --version
             echo "zip fresh run OK"
     - name: official-docker-validation
@@ -40,91 +41,26 @@ main:
           script: docker version --format '{{.Server.Version}}' && (docker compose version || true)
         - name: setup-tool
           script: |
-            mkdir -p /tmp/official && cd /tmp/official
-            cat > Dockerfile <<'EOF'
-            FROM --platform=linux/amd64 python:3.12-slim-bookworm
-
-            ENV DEBIAN_FRONTEND=noninteractive \
-                NODE_VERSION=22.16.0 \
-                GO_VERSION=1.22.4
-
-            RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/* && \
-                sed -i 's|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/*
-
-            RUN apt-get update && apt-get install -y --no-install-recommends \
-                curl ca-certificates unzip wget xz-utils openjdk-17-jdk \
-                && rm -rf /var/lib/apt/lists/*
-
-            RUN wget -q "https://registry.npmmirror.com/-/binary/node/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -O /tmp/node.tar.xz \
-                && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 && rm /tmp/node.tar.xz
-
-            RUN wget -q "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz \
-                && tar -C /usr/local -xzf /tmp/go.tar.gz && rm /tmp/go.tar.gz \
-                && ln -sf /usr/local/go/bin/go /usr/local/bin/go
-
-            WORKDIR /workspace
-            EOF
-            cat > docker-compose.yml <<'EOF'
-            services:
-              proxy:
-                image: ubuntu/squid:latest
-                entrypoint: ["/bin/sh", "-c"]
-                command:
-                  - |
-                    cat > /etc/squid/squid.conf <<'SQUID'
-                    http_port 3128
-                    acl whitelist dstdomain .aliyuncs.com
-                    acl SSL_ports port 443
-                    acl CONNECT method CONNECT
-                    http_access allow CONNECT SSL_ports whitelist
-                    http_access deny all
-                    cache deny all
-                    SQUID
-                    squid -N -f /etc/squid/squid.conf
-                networks:
-                  intranet:
-                  internet:
-
-              agent:
-                build:
-                  context: .
-                  dockerfile: Dockerfile
-                platform: linux/amd64
-                environment:
-                  - HTTPS_PROXY=http://proxy:3128
-                  - HTTP_PROXY=http://proxy:3128
-                  - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-mock}
-                  - DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/api/v1}
-                  - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-                  - AGENT_LOG_DIR=/home/user/ws/logs
-                volumes:
-                  - ${AGENT_DIR:-./agent}:/workspace:ro
-                  - ${INPUT_DIR:-./input}:/home/user/ws/input:ro
-                  - ${OUTPUT_DIR:-./output}:/home/user/ws/output:rw
-                  - ${AGENT_LOG_DIR:-./logs}:/home/user/ws/logs:rw
-                working_dir: /workspace
-                depends_on:
-                  - proxy
-                networks:
-                  intranet:
-
-            networks:
-              intranet:
-                internal: true
-              internet:
-                driver: bridge
-            EOF
-            # agent/ 用已打好的包
+            rm -rf /tmp/official && mkdir -p /tmp/official && cd /tmp/official
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/Dockerfile" .
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/docker-compose.yml" .
             cp -r "${CNB_BUILD_WORKSPACE}/dist/agent" ./agent
             cp -r "${CNB_BUILD_WORKSPACE}/raw/dataset_sample/Data_for_Users" ./input
             mkdir -p output logs
             echo "QW_FORCE_MOCK=1" > .env
+            echo "--- agent 目录内容 ---"
+            ls -la ./agent/ | head -8
+            echo "--- compose 解析的挂载 ---"
+            docker compose config 2>/dev/null | grep -A8 "volumes:" | head -12
         - name: build-images
           script: cd /tmp/official && docker compose build 2>&1 | tail -5
         - name: version-check
-          script: cd /tmp/official && docker compose run --rm agent python agent.py --version
+          script: |
+            cd /tmp/official
+            docker compose run --rm agent python /workspace/agent.py --version
         - name: full-mock-run
           script: |
-            cd /tmp/official && docker compose run --rm agent python agent.py --prompt "请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output"
+            cd /tmp/official && docker compose run --rm agent python /workspace/agent.py --prompt "请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output"
+            echo "--- 输出产物 ---"
             ls -la output/
-            head -5 output/*.md
+            for f in output/*.md; do echo "== $f =="; head -3 "$f"; done
