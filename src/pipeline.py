@@ -68,7 +68,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
