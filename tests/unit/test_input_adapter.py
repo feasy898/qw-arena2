@@ -117,11 +117,14 @@ class TestLoadInputSample:
         ]
 
     def test_user_description_pool_warning(self, bundle: InputBundle):
-        # 样例资料池含 6 份用户描述：全部装载、不擅自挑选、给 warning、置空单用户字段
+        # 样例资料池含 6 份用户描述：全部装载、给 warning。
+        # v0.3.0 起改为「取排序第一份作为单用户输入」（评测联调：官方机测 Prompt
+        # 输入说明写 n=1~6，多份不再整体失败——原置空行为会让主链在用户描述为空
+        # 处失败、整场 0 分）；断言同步为新契约。
         assert len(bundle.warnings) == 1
         assert "6 份用户描述" in bundle.warnings[0]
-        assert bundle.user_text == ""
-        assert bundle.user_description_path == ""
+        assert bundle.user_text != ""
+        assert bundle.user_description_path.endswith("User_Description_1.txt")
 
     def test_original_text_verbatim(self, bundle: InputBundle):
         coverage = record_of(bundle, "02_Media_Coverage_and_Reviews/P01_Product_Coverage.txt")
@@ -173,10 +176,11 @@ class TestFindUserDescription:
         assert found.endswith(os.path.join("00_User_Descriptions", "User_Description_1.txt"))
         assert os.path.isfile(found)
 
-    def test_sample_pool_six_users_raises(self):
-        with pytest.raises(InputError) as excinfo:
-            find_user_description(str(SAMPLE_DIR))
-        assert "6" in str(excinfo.value)
+    def test_sample_pool_six_users_returns_first(self):
+        # v0.3.0（评测联调）：官方机测 Prompt 输入说明写「n = 1~6」，多份用户描述
+        # 不再整体失败（原 InputError = 整场 0 分）；按文件名排序取第一份继续。
+        found = find_user_description(str(SAMPLE_DIR))
+        assert found.endswith(os.path.join("00_User_Descriptions", "User_Description_1.txt"))
 
     def test_zero_user_raises(self, tmp_path: Path):
         (tmp_path / "00_User_Descriptions").mkdir()

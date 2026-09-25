@@ -24,12 +24,15 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
 from src.schemas import SourceRecord, SourceType
+
+logger = logging.getLogger("qw.input_adapter")
 
 PathLike = Union[str, os.PathLike]
 
@@ -438,10 +441,14 @@ def find_user_description(input_dir: PathLike) -> str:
             f"（期望恰 1 个 {USER_DESC_PREFIX}*{USER_DESC_SUFFIX}）"
         )
     if len(names) > 1:
-        raise InputError(
-            f"{USER_DESC_DIRNAME} 下存在 {len(names)} 份用户描述文件（{'、'.join(names)}），"
-            "无法确定唯一目标用户；正式评测输入应恰含 1 份"
-        )
+        # v0.3.0（评测联调）：多份用户描述不再整体失败（原退出码 3 = 整场 0 分）。
+        # 官方机测 Prompt 的输入说明写「User_Description_n.txt, n = 1~6」，评测
+        # 输入形态存在多份可能；按文件名排序取第一份继续（画像字段唯一信息来源
+        # 即该文件），多份本身即记入日志告警。0 份仍为 InputError（无从画像）。
+        logger.warning(
+            "%s 下存在 %d 份用户描述文件（%s），正式评测应恰含 1 份；"
+            "按文件名排序取第一份（%s）继续（v0.3.0 健壮性：不因多份整体失败）",
+            USER_DESC_DIRNAME, len(names), "、".join(names), names[0])
     return os.path.join(desc_dir, names[0])
 
 
@@ -493,8 +500,8 @@ def _load_user_descriptions(
     if len(names) != 1:
         warnings.append(
             f"{USER_DESC_DIRNAME} 含 {len(names)} 份用户描述（正式评测恰为 1 份）；"
-            "已全部装载为来源记录、未擅自挑选；单用户定位须用 find_user_description()"
-            "（多份时其会报 InputError）"
+            "v0.3.0 健壮性：已按文件名排序取第一份作为单用户输入（不再整体失败），"
+            "全部来源记录仍装载"
         )
 
 
@@ -624,11 +631,16 @@ def load_input(input_dir: PathLike) -> InputBundle:
     _load_official_dir(root, records, warnings)
 
     user_records = [r for r in records if r.source_type is SourceType.USER_DESCRIPTION]
-    if len(user_records) == 1:
-        user_description_path = user_records[0].path or ""
-        user_text = user_records[0].original_text
+    if len(user_records) >= 1:
+        # v0.3.0（评测联调）：多份用户描述取排序第一份（与 find_user_description
+        # 的容忍口径一致——官方机测 Prompt 输入说明写「n = 1~6」，评测输入形态
+        # 存在多份可能；原「多份即空」会让主链在用户描述为空处失败）。
+        # 排序键与 find_user_description 相同，两处选择必然一致。
+        user_records_sorted = sorted(user_records, key=lambda r: _user_desc_sort_key(
+            os.path.basename(r.path or "")))
+        user_description_path = user_records_sorted[0].path or ""
+        user_text = user_records_sorted[0].original_text
     else:
-        # 多份用户描述（资料池）：不擅自挑选，唯一性约束由 find_user_description 强制
         user_description_path = ""
         user_text = ""
 

@@ -56,8 +56,13 @@ FATAL_STATUS_CODES = frozenset({401, 403, 404})
 _FATAL_BODY_MARKERS = (
     "invalid api key", "invalid_api_key", "invalidapikey", "unauthorized",
     "not authorized", "access denied", "forbidden", "arrearage", "in arrears",
+)
+# 模型级不可用（区别于鉴权/欠费致命）：命中即沿 fallback_models 候选链降级。
+# v0.3.0（平台评测联调）：fallback_models 配置此前从未被使用，单模型不可用=全局失败。
+_MODEL_UNAVAILABLE_MARKERS = (
     "model not found", "model.notfound", "model.not_exists", "model not exist",
-    "model not exists", "modelnotexist",
+    "model not exists", "modelnotexist", "invalid model", "model does not exist",
+    "no available model", "模型不存在", "模型不可用", "无可用模型",
 )
 _CONTEXT_OVERFLOW_MARKERS = (
     "context length", "maximum context", "max context", "input length",
@@ -223,6 +228,16 @@ class ModelGateway:
         self._session = requests.Session()
         self._fixture: Optional[dict] = None
         self._fixture_loaded = False
+        # v0.3.0 健壮性（平台评测联调反馈）：
+        # _suppress_extras——网关拒绝附加参数（400/422）时自适应置位，本会话内
+        # 之后所有请求只发最小载荷 {model, messages}；
+        # _demoted_models/_fallback_models——模型级不可用时的候选降级链。
+        self._suppress_extras = False
+        self._demoted_models: set[str] = set()
+        self._fallback_models = [
+            m for m in (self._config.get("fallback_models") or [])
+            if m in self._whitelist
+        ]
         api_mode = self._config.get("api_mode") or "openai_compatible"
         if api_mode != "openai_compatible":
             # platform_contract.api_modes 含 dashscope_native（可选），第一阶段未实现
@@ -284,7 +299,16 @@ class ModelGateway:
         self._validate_messages(messages)
         if self._mock:
             return self._chat_mock(messages, model, mock_key)
-        return self._chat_real(messages, model)
+        if model in self._demoted_models:
+            # 本会话内已被降级的模型不再作为首选（v0.3.0：候选链从 fallback 接续）
+            chain = [m for m in self._fallback_models if m not in self._demoted_models]
+            if not chain:
+                raise GatewayError(
+                    f"模型 {model} 此前已不可用且 fallback_models 候选链已耗尽")
+        else:
+            chain = [model] + [m for m in self._fallback_models
+                               if m != model and m not in self._demoted_models]
+        return self._chat_real(messages, chain)
 
     def chat_json(self, messages: list[dict], model: str, *,
                   mock_key: Optional[str] = None) -> dict:
@@ -399,26 +423,42 @@ class ModelGateway:
 
     # ---- real 分支 ----
 
-    def _chat_real(self, messages: list[dict], model: str) -> dict:
+    def _chat_real(self, messages: list[dict], chain: list[str]) -> dict:
+        """真实调用；chain 为按优先次序排列的模型候选链（首元素为当前首选）。
+
+        默认不发送 max_tokens（真实网关校准，2026-09）：显式限制过小时思考
+        （reasoning_content）会耗尽 token，导致 content 为空、finish_reason=length。
+
+        v0.3.0 健壮性（平台评测联调反馈，三发评测均「Agent运行错误」的对策）：
+        - 附加参数自适应抑制：400/422 且非上下文超限/模型不可用/致命时，若载荷
+          含附加参数（enable_thinking），本会话永久停用附加参数并立即以最小载荷
+          {model, messages} 免费重试一次（不消耗重试次数）——平台评测网关对
+          非标参数的兼容性无法预验，此路径保证参数被拒不再致命；
+        - 模型候选链：404 或响应体命中 _MODEL_UNAVAILABLE_MARKERS 时降级到链中
+          下一个候选模型（不消耗重试次数），链耗尽才报错；降级记录在
+          _demoted_models，本会话内不再把已降级模型作为首选；
+        - 鉴权/欠费（401/403 或 _FATAL_BODY_MARKERS）仍为 UpstreamFatalError。
+        """
         assert self._base_url is not None and self._api_key is not None
         url = f"{self._base_url}/chat/completions"
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._api_key}"}
-        # 默认不发送 max_tokens（真实网关校准，2026-09）：显式限制过小时思考
-        # （reasoning_content）会耗尽 token，导致 content 为空、finish_reason=length。
-        payload = {"model": model, "messages": messages}
-        # 思考开关（真实模型联调校准，2026-09-24）：仅当配置含 enable_thinking 键
-        # 才发送该参数（缺省行为与契约一致，请求体恰为 {model, messages}）。
-        # 真实网关实测：qwen3.6-plus 思考默认开启，产品抽取类复杂请求服务端长静默
-        # >300s（思考不外发任何字节），单请求超时必然 ReadTimeout；enable_thinking
-        # =False 实测 200、无 reasoning_content、耗时与 completion tokens 大幅下降。
-        # 非 Qwen 系模型对该参数的兼容性未验证（openIssues 登记）。
         thinking = self._config.get("enable_thinking")
-        if thinking is not None:
-            payload["enable_thinking"] = bool(thinking)
+
+        def _build_payload(model: str) -> dict:
+            payload: dict = {"model": model, "messages": messages}
+            if thinking is not None and not self._suppress_extras:
+                payload["enable_thinking"] = bool(thinking)
+            return payload
+
         attempts = max(0, int(self._config.get("max_retries_per_request", 2))) + 1
         last_error = "未知错误"
-        for attempt in range(attempts):
+        attempt = 0
+        while attempt < attempts:
+            if not chain:
+                raise GatewayError(f"模型候选链耗尽（均不可用）：{last_error}")
+            model = chain[0]
+            payload = _build_payload(model)
             if self._budget.hard_expired():
                 raise GatewayError("已超硬截止，停止模型请求（budget_manager）")
             timeout = self._request_timeout()
@@ -429,31 +469,55 @@ class ModelGateway:
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = f"网络异常 {type(exc).__name__}"
                 logger.warning("chat attempt=%d model=%s %s", attempt + 1, model, last_error)
-            else:
-                latency = time.monotonic() - started
-                status = response.status_code
-                logger.info("chat attempt=%d model=%s status=%s latency=%.2fs timeout=%.1fs",
-                            attempt + 1, model, status, latency, timeout)
-                if status == 200:
-                    return self._parse_ok_response(response, model, messages)
-                if status in RETRYABLE_STATUS_CODES:
-                    last_error = f"HTTP {status}（可重试）"
-                elif status in FATAL_STATUS_CODES:
-                    raise UpstreamFatalError(self._describe_error(response, status))
-                else:
-                    body_text = self._safe_body_text(response)
-                    if status in (400, 422) and _matches_any(body_text, _CONTEXT_OVERFLOW_MARKERS):
-                        raise ContextTooLongError(
-                            f"上下文超限（调用方应缩小分块）HTTP {status}: "
-                            f"{_summarize(body_text)}")
-                    if _matches_any(body_text, _FATAL_BODY_MARKERS):
-                        raise UpstreamFatalError(self._describe_error(response, status))
-                    raise GatewayError(
-                        f"上游非预期状态 HTTP {status}: {_summarize(body_text)}")
-            if attempt < attempts - 1:
-                backoff = RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt) + self._rand()
-                logger.info("退避重试 %.2fs 后进行（attempt=%d）", backoff, attempt + 1)
-                self._sleep(backoff)
+                attempt += 1
+                if attempt < attempts:
+                    backoff = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + self._rand()
+                    logger.info("退避重试 %.2fs 后进行（attempt=%d）", backoff, attempt + 1)
+                    self._sleep(backoff)
+                continue
+            latency = time.monotonic() - started
+            status = response.status_code
+            logger.info("chat attempt=%d model=%s status=%s latency=%.2fs timeout=%.1fs",
+                        attempt + 1, model, status, latency, timeout)
+            if status == 200:
+                return self._parse_ok_response(response, model, messages)
+            body_text = self._safe_body_text(response)
+            if status in (400, 422) and _matches_any(body_text, _CONTEXT_OVERFLOW_MARKERS):
+                raise ContextTooLongError(
+                    f"上下文超限（调用方应缩小分块）HTTP {status}: "
+                    f"{_summarize(body_text)}")
+            if status == 404 or (status in (400, 422)
+                                 and _matches_any(body_text, _MODEL_UNAVAILABLE_MARKERS)):
+                self._demoted_models.add(model)
+                if len(chain) > 1:
+                    chain = chain[1:]
+                    logger.warning("模型 %s 不可用（HTTP %s: %s），降级到候选模型 %s",
+                                   model, status, _summarize(body_text), chain[0])
+                    continue  # 模型切换不消耗重试次数
+                last_error = f"模型不可用 HTTP {status}: {_summarize(body_text)}"
+                break
+            if (status in (400, 422) and "enable_thinking" in payload
+                    and not self._suppress_extras):
+                self._suppress_extras = True
+                logger.warning("网关拒绝附加参数（HTTP %s: %s）；停用 enable_thinking，"
+                               "以最小载荷立即重试（本会话生效）", status, _summarize(body_text))
+                continue  # 参数抑制重试不消耗重试次数
+            if status in RETRYABLE_STATUS_CODES:
+                last_error = f"HTTP {status}（可重试）"
+                attempt += 1
+                if attempt < attempts:
+                    backoff = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + self._rand()
+                    logger.info("退避重试 %.2fs 后进行（attempt=%d）", backoff, attempt + 1)
+                    self._sleep(backoff)
+                continue
+            if status in FATAL_STATUS_CODES:
+                raise UpstreamFatalError(self._describe_error(response, status))
+            if _matches_any(body_text, _FATAL_BODY_MARKERS):
+                raise UpstreamFatalError(self._describe_error(response, status))
+            last_error = f"上游非预期状态 HTTP {status}: {_summarize(body_text)}"
+            attempt += 1
+            if attempt < attempts:
+                self._sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + self._rand())
         raise GatewayError(f"重试用尽（共 {attempts} 次尝试）：{last_error}")
 
     def _parse_ok_response(self, response: requests.Response, model: str,

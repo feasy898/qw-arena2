@@ -103,6 +103,12 @@ def make_real_gateway(monkeypatch, outcomes, config=None):
     return gateway, fake, sleeps
 
 
+def _ok_body(content: str) -> dict:
+    """构造最小合法 200 响应体（choices[0].message.content=content）。"""
+    return {"choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+
 # ---------- is_mock_mode ----------
 
 def test_is_mock_mode_without_key(monkeypatch):
@@ -282,9 +288,10 @@ def test_network_exception_is_retried(monkeypatch):
 
 # ---------- real 模式：致命错误（不重试） ----------
 
-@pytest.mark.parametrize("status,code", [(401, "InvalidApiKey"), (403, "AccessDenied"),
-                                         (404, "Model.NotFound")])
+@pytest.mark.parametrize("status,code", [(401, "InvalidApiKey"), (403, "AccessDenied")])
 def test_fatal_status_no_retry(monkeypatch, status, code):
+    # v0.3.0 起 404/模型不可用走候选链降级（见 test_model_404_falls_back），
+    # 致命状态码仅剩鉴权类（401/403）。
     gateway, fake, sleeps = make_real_gateway(
         monkeypatch, [FakeResponse(status, {"error": {"code": code,
                                                       "message": "fatal"}})])
@@ -292,6 +299,35 @@ def test_fatal_status_no_retry(monkeypatch, status, code):
         gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
     assert len(fake.calls) == 1
     assert sleeps == []
+
+
+def test_model_404_falls_back_to_next_candidate(monkeypatch):
+    # v0.3.0（评测联调）：fallback_models 此前从未被使用，单模型不可用=全局失败。
+    # 现在 404/模型不可用标记 → 降级到候选链下一个模型继续（不消耗重试次数）。
+    gateway, fake, sleeps = make_real_gateway(
+        monkeypatch,
+        [FakeResponse(404, {"error": {"code": "Model.NotFound",
+                                      "message": "model not found"}}),
+         FakeResponse(200, _ok_body("{\"ok\": 1}"))])
+    out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert out["model"] == "qwen3.6-flash" and out["content"] == "{\"ok\": 1}"
+    assert len(fake.calls) == 2 and sleeps == []
+    # 本会话内已降级模型不再作为首选：再次调用直接从候选模型开始
+    fake.outcomes.append(FakeResponse(200, _ok_body("x")))
+    gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert fake.calls[-1]["json"]["model"] == "qwen3.6-flash"
+
+
+def test_model_chain_exhausted_raises_gateway_error(monkeypatch):
+    gateway, fake, _ = make_real_gateway(
+        monkeypatch,
+        [FakeResponse(404, {"error": {"code": "Model.NotFound",
+                                      "message": "model not found"}}),
+         FakeResponse(404, {"error": {"code": "Model.NotFound",
+                                      "message": "model not found"}})])
+    with pytest.raises(GatewayError) as excinfo:
+        gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert "候选链耗尽" in str(excinfo.value) or "模型不可用" in str(excinfo.value)
 
 
 def test_fatal_body_marker_no_retry(monkeypatch):
@@ -326,14 +362,23 @@ def test_context_too_long_no_retry(monkeypatch):
     assert len(fake.calls) == 1 and sleeps == []
 
 
-def test_other_400_raises_gateway_error_without_retry(monkeypatch):
-    gateway, fake, _ = make_real_gateway(
-        monkeypatch, [FakeResponse(400, {"error": {"code": "InvalidParameter",
-                                                   "message": "'temperature' must be > 0"}})])
-    with pytest.raises(GatewayError) as excinfo:
-        gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
-    assert not isinstance(excinfo.value, (UpstreamFatalError, ContextTooLongError))
-    assert len(fake.calls) == 1
+def test_param_reject_400_suppresses_extras_and_retries_minimal(monkeypatch):
+    # v0.3.0（评测联调）：400 拒绝附加参数（enable_thinking）不再致命——本会话
+    # 停用附加参数并以最小载荷免费重试一次；此后所有请求直接最小载荷。
+    gateway, fake, sleeps = make_real_gateway(
+        monkeypatch,
+        [FakeResponse(400, {"error": {"code": "InvalidParameter",
+                                      "message": "unknown parameter 'enable_thinking'"}}),
+         FakeResponse(200, _ok_body("{\"ok\": 1}"))],
+        config=base_config(enable_thinking=False))
+    out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert out["content"] == "{\"ok\": 1}"
+    assert len(fake.calls) == 2 and sleeps == []
+    assert "enable_thinking" in fake.calls[0]["json"]
+    assert "enable_thinking" not in fake.calls[1]["json"]
+    fake.outcomes.append(FakeResponse(200, _ok_body("x")))
+    gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert "enable_thinking" not in fake.calls[-1]["json"]
 
 
 # ---------- 预算联动 ----------

@@ -5,4 +5,4 @@
 业务规则见 contracts/rules.json；平台硬约束见 contracts/platform_contract.json。
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
