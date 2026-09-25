@@ -412,18 +412,34 @@ def _user_desc_sort_key(name: str) -> tuple[int, str]:
 
 
 def find_user_description(input_dir: PathLike) -> str:
-    """返回 00_User_Descriptions 下唯一用户描述文件路径。
+    """返回用户描述文件路径（00_User_Descriptions 下，或全树发现的第一个）。
 
     官方约定该目录为「用户画像的唯一信息来源」，n = 1~6（正式评测可能不同）。
-    0 份或多份 → raise InputError（不得自行挑选其一）。
+    0 份 → raise InputError；多份取排序第一份（v0.3.0，不再整体失败）。
+
+    v0.4.1：标准子目录缺失时按文件名模式全树发现（与 load_input 的规范化
+    装载同一口径，两处选择必然一致）。
 
     :param input_dir: 输入目录
-    :raises InputError: 文件数为 0 或多于 1，或目录缺失
+    :raises InputError: 文件数为 0 或目录缺失
     :return: 用户描述文件路径（str）
     """
     root = os.fspath(input_dir)
     desc_dir = os.path.join(root, USER_DESC_DIRNAME)
     if not os.path.isdir(desc_dir):
+        # v0.4.1：全树发现
+        hits = [
+            os.path.join(dirpath, name)
+            for dirpath, _dirs, filenames in os.walk(root)
+            for name in filenames
+            if re.fullmatch(rf"{USER_DESC_PREFIX}\d+{re.escape(USER_DESC_SUFFIX)}", name)
+        ]
+        if hits:
+            hits.sort(key=lambda p: _user_desc_sort_key(os.path.basename(p)))
+            logger.warning(
+                "输入目录缺少 %s 子目录；按文件名模式全树发现 %d 份用户描述，"
+                "取第一份：%s", USER_DESC_DIRNAME, len(hits), hits[0])
+            return hits[0]
         raise InputError(f"输入目录缺少必需子目录：{USER_DESC_DIRNAME}（root={root}）")
     names = sorted(
         (
@@ -597,26 +613,73 @@ def _load_official_dir(root: str, records: list[SourceRecord], warnings: list[st
         records.append(_make_text_record(OFFICIAL_DIRNAME, name, path, SourceType.OFFICIAL_SITE, text))
 
 
+def _normalize_input_root(root: str) -> tuple[str, Optional[str], list[str]]:
+    """v0.4.1（评测联调）：输入目录形状容差。
+
+    标准五子目录齐备 → 原样返回。缺失时：按文件名模式全树发现（各源文件名
+    约定唯一、与目录位置无关），把发现的文件**符号链接**（Linux 评测环境）或
+    **复制**（Windows 开发环境回退）进规范化临时目录，复用全部既有加载逻辑。
+    发现不到任何可归类文件 → 返回原 root（让标准路径给出精确报错）。
+
+    :return: (生效 root, 规范化临时目录或 None, warnings)
+    """
+    missing = [d for d in REQUIRED_SUBDIRS if not os.path.isdir(os.path.join(root, d))]
+    if not missing:
+        return root, None, []
+    warnings = [f"输入目录缺少标准子目录（{'、'.join(missing)}）；已按文件名模式全树发现并规范化装载"]
+
+    patterns = {
+        USER_DESC_DIRNAME: re.compile(rf"{USER_DESC_PREFIX}\d+{re.escape(USER_DESC_SUFFIX)}$"),
+        LISTING_DIRNAME: re.compile(r".*Listing_Snapshot\.csv$", re.IGNORECASE),
+        MEDIA_DIRNAME: re.compile(r"P\d+_(Product_Coverage|Third_Party_Review)\.txt$"),
+        FEEDBACK_DIRNAME: re.compile(r"User_Feedback.*\.csv$", re.IGNORECASE),
+        OFFICIAL_DIRNAME: re.compile(r"P\d+_.+_Official_Site\.txt$"),
+    }
+    found: dict[str, list[str]] = {d: [] for d in REQUIRED_SUBDIRS}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            for dirname, pattern in patterns.items():
+                if pattern.match(name):
+                    found[dirname].append(os.path.join(dirpath, name))
+    if not any(found.values()):
+        return root, None, warnings
+
+    import tempfile
+    norm_root = tempfile.mkdtemp(prefix="qw_input_norm_")
+    for dirname, paths in found.items():
+        os.makedirs(os.path.join(norm_root, dirname), exist_ok=True)
+        for src_path in paths:
+            dst = os.path.join(norm_root, dirname, os.path.basename(src_path))
+            try:
+                os.symlink(os.path.abspath(src_path), dst)
+            except (OSError, NotImplementedError):
+                import shutil
+                shutil.copy2(src_path, dst)
+    return norm_root, norm_root, warnings
+
+
 def load_input(input_dir: PathLike) -> InputBundle:
     """扫描输入目录，装载用户描述与五源产品资料。
 
     生成 SourceRecord 列表：source_id 稳定（相对路径，CSV 行追加 #rowN）、
     source_type 取 schemas.SourceType、original_text 为原文（UTF-8，容忍 BOM）、
     spans 为稳定片段编号（span_id=物理行号，偏移指向 original_text）。
-    货架/反馈 CSV 逐行成 Record。目录结构不合法或缺必需子目录 → raise InputError。
+    货架/反馈 CSV 逐行成 Record。
+
+    v0.4.1（评测联调）：标准五子目录缺失时按文件名模式全树发现并规范化装载
+    （评测输入的真实形状无法预知，快速失败 = 整场 0 分）。
 
     :param input_dir: 输入目录（如 /home/user/ws/input）
-    :raises InputError: 目录或必需子目录不合法、必需文件缺失、文件为空或编码非法
+    :raises InputError: 目录不合法、必需文件缺失、文件为空或编码非法
     :return: InputBundle
     """
     root = os.fspath(input_dir)
     if not os.path.isdir(root):
         raise InputError(f"输入目录不存在或不是目录：{root}")
-    missing = [d for d in REQUIRED_SUBDIRS if not os.path.isdir(os.path.join(root, d))]
-    if missing:
-        raise InputError(f"输入目录缺少必需子目录：{'、'.join(missing)}（root={root}）")
+    root, _temp_root, norm_warnings = _normalize_input_root(root)
 
     warnings: list[str] = []
+    warnings.extend(norm_warnings)
     records: list[SourceRecord] = []
     _load_user_descriptions(root, records, warnings)
     _load_csv_dir(

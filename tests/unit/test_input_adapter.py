@@ -217,19 +217,26 @@ class TestBadInputs:
             load_input(str(tmp_path / "不存在"))
         assert "输入目录不存在" in str(excinfo.value)
 
-    def test_missing_required_subdir(self, tmp_path: Path):
+    def test_missing_required_subdir_no_discovery(self, tmp_path: Path):
+        # v0.4.1：标准子目录缺失时按文件名模式全树发现并规范化装载；目录里
+        # 没有任何可归类文件时仍报 InputError（目录为空/无资料）。
         (tmp_path / "00_User_Descriptions").mkdir()
         with pytest.raises(InputError) as excinfo:
             load_input(str(tmp_path))
-        message = str(excinfo.value)
-        assert "缺少必需子目录" in message
-        for name in (
-            "01_Ecommerce_Listings",
-            "02_Media_Coverage_and_Reviews",
-            "03_User_Feedback_and_Complaints",
-            "04_Brand_Official_Sites",
-        ):
-            assert name in message
+        assert "用户描述文件为空" in str(excinfo.value) or "未找到" in str(excinfo.value)
+
+    def test_flat_layout_discovery_loads_all(self, tmp_path: Path):
+        # v0.4.1（评测联调）：五源文件全部平铺在根目录（最恶劣形状）也能装载。
+        import shutil as _shutil
+        sample = Path(__file__).resolve().parents[2] / "raw" / "dataset_sample" / "Data_for_Users"
+        for sub in ("00_User_Descriptions", "01_Ecommerce_Listings",
+                    "02_Media_Coverage_and_Reviews", "03_User_Feedback_and_Complaints",
+                    "04_Brand_Official_Sites"):
+            for f in (sample / sub).iterdir():
+                _shutil.copy(f, tmp_path / f.name)
+        bundle = load_input(str(tmp_path))
+        assert len(bundle.source_records) == 29
+        assert bundle.user_text != ""
 
     def test_empty_user_description_file(self, tmp_path: Path):
         root = make_minimal_input(tmp_path / "in")
