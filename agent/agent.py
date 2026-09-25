@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """agent/agent.py — 提交包入口（contracts/platform_contract.json runtime.entry）。
 

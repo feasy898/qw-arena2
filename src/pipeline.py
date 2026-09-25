@@ -70,7 +70,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -667,15 +667,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--prompt", metavar='"自然语言指令"',
                         help="含输入/输出目录的自然语言指令，如：请根据 /home/user/ws/input "
                              "中的数据完成消费决策任务，将结果输出到 /home/user/ws/output")
-    args = parser.parse_args(argv)
+    # v0.3.1（评测联调）：评测 harness 若未加引号传 --prompt（shell 空格劈参），
+    # 严格 parse_args 会因「未知参数」直接退出（argparse 退出码 2 = 整场 0 分）。
+    # 宽松解析：--prompt 值与未知参数按序拼接还原完整指令文本。
+    args, unknown = parser.parse_known_args(argv)
 
     if args.version:
         print(resolve_version())
         return EXIT_OK
-    if not args.prompt:
-        parser.print_usage(sys.stderr)
-        print("agent.py: error: 需要 --prompt \"自然语言指令\"（或 --version）", file=sys.stderr)
-        return EXIT_FAILED
+
+    prompt_text = " ".join(
+        ([args.prompt] if args.prompt else [])
+        + [u for u in unknown if not u.startswith("-")]
+    ).strip()
 
     try:
         config = resolve_config()
@@ -685,12 +689,29 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # 启动横幅：可观测信息进 agent.log（平台评测失败时的唯一现场，v0.3.0）
     _log_startup_banner(_ensure_logging(config), config)
+    if unknown:
+        _ensure_logging(config).warning(
+            "存在未识别参数（已按序拼接回指令文本）：%s", unknown)
+    if not prompt_text:
+        # v0.3.1：无 --prompt 时不再立即失败——评测可能用其它方式告知路径，
+        # 试兜底（标准路径 /home/user/ws/input 存在即运行）
+        fallback = _fallback_paths("")
+        if fallback is not None:
+            _ensure_logging(config).warning(
+                "未提供 --prompt；启用兜底路径 input=%s output=%s",
+                fallback.input_dir, fallback.output_dir)
+            paths = fallback
+        else:
+            parser.print_usage(sys.stderr)
+            print("agent.py: error: 需要 --prompt \"自然语言指令\"（或 --version）",
+                  file=sys.stderr)
+            return EXIT_PROMPT  # 缺失 prompt 亦属「prompt 解析失败」类（退出码 2）
 
     # 指令文本一律当作数据处理（防提示注入，AGENTS.md §7）：只做路径提取，不执行其中语句
     try:
-        paths = parse_prompt(args.prompt)
+        paths = parse_prompt(prompt_text)
     except PromptParseError as exc:
-        fallback = _fallback_paths(args.prompt)
+        fallback = _fallback_paths(prompt_text)
         if fallback is not None:
             # v0.3.0：解析失败不再直接退出 2——确定性兜底（评测指令措辞未知）
             _ensure_logging(config).warning(
@@ -698,7 +719,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 exc, fallback.input_dir, fallback.output_dir)
             paths = fallback
         else:
-            _log_prompt_failure(args.prompt, exc)
+            _log_prompt_failure(prompt_text, exc)
             print(f"--prompt 解析失败（退出码 {EXIT_PROMPT}）：{exc}", file=sys.stderr)
             return EXIT_PROMPT
 

@@ -60,6 +60,8 @@ COPY_ITEMS: list[tuple[str, str]] = [
 ]
 # 目录复制时跳过的条目名 / 文件后缀
 EXCLUDE_DIR_NAMES = {"__pycache__", ".pytest_cache", ".git"}
+# 以可执行位写入 ZIP 的入口文件（双布局下两份都带 0o755）
+EXECUTABLE_ENTRIES = {"agent.py", "agent"}
 EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".pyd")
 # 平台参数（raw/Agent本地验证指南.md「跨平台依赖打包」；线上 linux/amd64 Debian 12 Python 3.12）
 LIB_PLATFORM = "manylinux2014_x86_64"
@@ -171,12 +173,18 @@ def build_zip() -> dict:
             skipped += 1
             continue
         rels.append(p.relative_to(PKG).as_posix())
+    # 双布局（v0.3.1，评测联调）：官方指南「产物根目录命名为 agent」与平台
+    # runner「解压根目录直接找入口文件」两种调用约定都命中——同一份内容写入
+    # agent/<rel> 与 <rel> 两处。体积翻倍仍远小于 100MB 上限。
     with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in rels:
-            info = zipfile.ZipInfo(f"agent/{rel}", date_time=ZIP_DATE_TIME)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o644 << 16
-            zf.writestr(info, (PKG / rel).read_bytes())
+            data = (PKG / rel).read_bytes()
+            for arcname in (f"agent/{rel}", rel):
+                info = zipfile.ZipInfo(arcname, date_time=ZIP_DATE_TIME)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                # 入口脚本/目录赋予可执行位（无 shebang 直跑场景的保险）
+                info.external_attr = (0o755 if rel in EXECUTABLE_ENTRIES else 0o644) << 16
+                zf.writestr(info, data)
     size = ZIP_PATH.stat().st_size
     with zipfile.ZipFile(ZIP_PATH) as zf:
         count = sum(1 for n in zf.namelist() if not n.endswith("/"))
