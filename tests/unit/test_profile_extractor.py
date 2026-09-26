@@ -24,6 +24,7 @@ from src.profile_extractor import (
     derive_user_needs,
     extract_profile,
     extract_profile_bundle,
+    profile_id_from_filename,
     render_profile_prompt,
 )
 from src.schemas import NeedType
@@ -186,3 +187,49 @@ def test_render_prompt_embeds_user_text():
     rendered = render_profile_prompt(USER1_TEXT)
     assert USER1_TEXT.strip() in rendered
     assert "{{USER_TEXT}}" not in rendered
+
+
+# ---------- 画像编号注入（文件名编号 → profile_id，官方 value_rule） ----------
+
+def test_profile_id_from_filename_helper():
+    assert profile_id_from_filename("User_Description_3.txt") == "User_Description_3"
+    assert profile_id_from_filename(
+        "/home/user/ws/input/00_User_Descriptions/User_Description_12.txt"
+    ) == "User_Description_12"
+    assert profile_id_from_filename(str(USER1_PATH)) == "User_Description_1"
+    # 解析不出 → None（调用方保持现状，渲染「未提供」）
+    assert profile_id_from_filename(None) is None
+    assert profile_id_from_filename("") is None
+    assert profile_id_from_filename("user_notes.txt") is None
+
+
+def test_profile_id_injected_from_filename_overrides_model_value(gateway):
+    # 传入文件名 → 代码层在校验后注入 profile_id；文件名是权威来源，
+    # 覆盖模型输出值（夹具自报 User_Description_1 也不例外）
+    profile, needs = extract_profile_bundle(
+        USER1_TEXT, gateway, make_config(),
+        user_description_file="User_Description_3.txt")
+    assert profile["profile_id"] == "User_Description_3"
+    # 注入不影响其余画像字段与需求派生
+    assert profile["name"] == "小王"
+    assert needs
+
+
+def test_extract_profile_contract_signature_passthrough_filename(gateway):
+    # 契约签名 extract_profile 的可选参数透传生效
+    profile = extract_profile(USER1_TEXT, gateway, make_config(),
+                              user_description_file="00_User_Descriptions/User_Description_5.txt")
+    assert profile["profile_id"] == "User_Description_5"
+
+
+def test_profile_id_without_filename_keeps_current_behavior(extracted):
+    # 缺省不传文件名：行为与既有完全一致（profile_id 取模型归一化结果）
+    assert extracted[0]["profile_id"] == "User_Description_1"
+
+
+def test_profile_id_unparseable_filename_keeps_model_value(gateway):
+    # 文件名不含编号 → 不注入，保持模型归一化结果（夹具值原样保留）
+    profile, _needs = extract_profile_bundle(
+        USER1_TEXT, gateway, make_config(),
+        user_description_file="描述文件.txt")
+    assert profile["profile_id"] == "User_Description_1"
