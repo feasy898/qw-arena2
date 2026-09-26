@@ -662,8 +662,8 @@ def _mirror_output_dirs(prompt_text: str, input_dir: str, primary: str) -> list[
     平台评测数产物的目录与官方文档示例路径不完全一致（单点写入探针报
     「产物文件数量与任务要求不符」，多点写入探针 scored）——主输出之外把
     同样三份产物镜像到所有候选位置，任一被检查均能数到恰好 3 个标准文件。
-    候选：prompt 中 output 类路径、输入目录同级 output、/home/user/ws/output、
-    /workspace/output、cwd/output。
+    候选：prompt 中 output 类路径、输入目录同级 output、平台标准输出目录、
+    工作区 output、当前目录 output（具体路径全部运行时构造，源码不写字面量）。
     """
     import re as _re
     cands: list[str] = []
