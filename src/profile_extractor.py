@@ -2,9 +2,13 @@
 """src/profile_extractor.py — 用户画像抽取（模型环节）。
 
 契约（contracts/interfaces.md §7）：
-- extract_profile(user_text, gateway, config) -> dict：画像对象，key 见
-  contracts/field_catalog.json profile.groups[].fields[].key（扁平；
+- extract_profile(user_text, gateway, config, user_description_file=None) -> dict：
+  画像对象，key 见 contracts/field_catalog.json
+  profile.groups[].fields[].key（扁平；
   scenes 为 list[dict]，item key 见 item_fields[].key）；
+  末位可选参数 user_description_file 传用户描述文件名时，代码层在模型输出
+  校验后注入 profile_id=User_Description_{n}（编号即文件名中的 n，官方
+  value_rule）；不传（None）行为与既有签名完全一致；
 - 原子化：一句话含多个事实拆成可独立核验的原子记录（SPEC §6）；
 - 硬约束准入与场景优先级按 contracts/rules.json（约(单值)预算不得直接成硬上限）；
 - 偏好只收原文明确表达；时长/频率缺失写「未提供」，不常识补全。
@@ -49,6 +53,7 @@ FIELD_CATALOG_PATH = REPO_ROOT / "contracts" / "field_catalog.json"
 USER_TEXT_PLACEHOLDER = "{{USER_TEXT}}"
 
 PROFILE_ID_RE = re.compile(r"^User_Description_\d+$")
+PROFILE_FILENAME_NUMBER_RE = re.compile(r"User_Description_(\d+)")
 _NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 
 REPAIR_INSTRUCTION = (
@@ -79,21 +84,32 @@ NEED_TYPES = tuple(t.value for t in NeedType)
 # 契约入口
 # ---------------------------------------------------------------------------
 
-def extract_profile(user_text: str, gateway, config: dict) -> dict:
+def extract_profile(user_text: str, gateway, config: dict,
+                    user_description_file: str | None = None) -> dict:
     """将用户自然语言描述抽取为画像对象（契约签名）。
 
     :param user_text: 用户描述原文（唯一信息来源）
     :param gateway: ModelGateway 实例
     :param config: resolve_config 产出的配置
+    :param user_description_file: 用户描述文件名（如 User_Description_1.txt，
+        也可传完整路径）；仅用于按官方 value_rule 解析画像编号注入 profile_id，
+        缺省 None 时行为与不传完全一致
     :return: 画像对象 dict（扁平 key，结构化列表 scenes 为 list[dict]）
     :raises src.model_gateway.GatewayError: 模型输出经有限重试仍不合法
     """
-    return extract_profile_bundle(user_text, gateway, config)[0]
+    return extract_profile_bundle(user_text, gateway, config,
+                                  user_description_file=user_description_file)[0]
 
 
-def extract_profile_bundle(user_text: str, gateway, config: dict) -> tuple[dict, list[UserNeed]]:
+def extract_profile_bundle(user_text: str, gateway, config: dict,
+                           user_description_file: str | None = None
+                           ) -> tuple[dict, list[UserNeed]]:
     """画像抽取 + 原子化 UserNeed 派生（一次网关调用）。
 
+    :param user_description_file: 用户描述文件名/路径（可选）；编号解析规则见
+        profile_id_from_filename，解析成功时在「模型输出校验之后、渲染之前」
+        注入 profile_id（官方机测 Prompt 输入为 User_Description_n.txt，编号
+        即文件名中的 n，代码层注入比模型自报更可靠）
     :return: (画像对象, UserNeed 列表)；UserNeed 优先取模型输出的原子需求
         （证据引文由代码定位回原文行片段），模型未给出时用 derive_user_needs 兜底
     :raises src.model_gateway.GatewayError: 模型输出经一次修复重试仍不合法
@@ -113,6 +129,15 @@ def extract_profile_bundle(user_text: str, gateway, config: dict) -> tuple[dict,
         parsed = gateway.chat_json(messages, model, mock_key=MOCK_KEY)
         profile, needs, problems = _normalize_profile(parsed, text)
         if not problems:
+            # 画像编号由代码层注入（field_catalog value_rule：取输入文件名编号
+            # User_Description_{n}）。注入点在「模型输出结构校验之后、渲染之前」：
+            # 不参与模型输出校验与修复重试判定，mock 夹具（模型输出形态）无需改动；
+            # 文件名是权威来源，覆盖模型自报值；解析不出则保持模型归一化结果
+            # （profile_id 为空 → 渲染「未提供」，与既有行为一致）。防提示注入
+            # 纪律：文件名只用于提取编号，绝不进入提示词正文。
+            injected_id = profile_id_from_filename(user_description_file)
+            if injected_id is not None:
+                profile["profile_id"] = injected_id
             logger.info("画像抽取成功 attempt=%d 耗时=%.2fs 需求=%d",
                         attempt, time.monotonic() - started, len(needs))
             return profile, needs
@@ -136,6 +161,26 @@ def render_profile_prompt(user_text: str) -> str:
     if USER_TEXT_PLACEHOLDER not in template:
         raise GatewayError(f"画像抽取 Prompt 模板缺少占位符 {USER_TEXT_PLACEHOLDER}: {path}")
     return template.replace(USER_TEXT_PLACEHOLDER, user_text or "")
+
+
+def profile_id_from_filename(user_description_file: str | None) -> str | None:
+    """从用户描述文件名（或完整路径）解析画像编号（官方 value_rule）。
+
+    field_catalog profile.groups[标识].value_rule：「取输入文件名编号：
+    User_Description_{n}（n 为文件名中的数字）」。取基名后按
+    PROFILE_FILENAME_NUMBER_RE 提取 n，返回 "User_Description_n"。
+
+    防提示注入纪律：文件名只用于提取编号，绝不进入提示词正文。
+    :return: 如 "User_Description_3"；入参为空或解析不出编号 → None
+        （调用方保持既有行为，渲染「未提供」）
+    """
+    if not user_description_file:
+        return None
+    basename = Path(str(user_description_file)).name
+    match = PROFILE_FILENAME_NUMBER_RE.search(basename)
+    if not match:
+        return None
+    return f"User_Description_{match.group(1)}"
 
 
 def derive_user_needs(user_text: str, profile: dict) -> list[UserNeed]:
