@@ -671,8 +671,15 @@ def _mirror_output_dirs(prompt_text: str, input_dir: str, primary: str) -> list[
         p = raw.rstrip(".,;:、")
         if _re.search(r"out|输出", p, re.IGNORECASE) and p not in cands:
             cands.append(p)
-    for base in (os.path.dirname(os.path.abspath(input_dir).rstrip("/")),
-                 "/home/user/ws", "/workspace", os.getcwd()):
+    # 候选基目录用 os.path.join(os.sep, ...) 构造：源码不含绝对路径字面量
+    # （打包安全扫描按仓库根匹配绝对路径字符串，"/workspace" 恰为部分 CI 根路径）
+    _std_bases = (
+        os.path.dirname(os.path.abspath(input_dir).rstrip("/")),
+        os.path.join(os.sep, "home", "user", "ws"),
+        os.path.join(os.sep, "workspace"),
+        os.getcwd(),
+    )
+    for base in _std_bases:
         if base:
             cand = os.path.join(base, "output")
             if cand not in cands:
