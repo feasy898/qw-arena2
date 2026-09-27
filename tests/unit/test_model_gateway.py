@@ -488,3 +488,24 @@ def test_real_mode_requires_api_key(monkeypatch):
     # 键值非法暴露：这里验证 mock 判定优先，网关构造不报错。
     gateway = ModelGateway(base_config())
     assert gateway.mock_mode is True
+
+
+# ---------- v0.4.4：base_url 候选切换（平台评测联调） ----------
+
+def test_connection_error_switches_base_url_candidate(monkeypatch):
+    """env 指向不可达地址 → 连接失败切换官方默认候选（不消耗重试次数）后成功。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-fake-gateway.invalid/v1")
+    gateway = ModelGateway(base_config())
+    fake = FakeSession([requests.exceptions.ConnectionError("refused"),
+                        FakeResponse(200, _ok_body("{\"ok\": 1}"))])
+    gateway._session = fake
+    sleeps: list[float] = []
+    gateway._sleep = sleeps.append
+    gateway._rand = lambda: 0.0
+    out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert out["content"] == "{\"ok\": 1}"
+    assert len(fake.calls) == 2 and sleeps == []
+    # 两次调用的 url 不同（第二个是官方默认候选）
+    assert fake.calls[0]["url"] != fake.calls[1]["url"]
+    assert fake.calls[1]["url"].endswith("/chat/completions")
