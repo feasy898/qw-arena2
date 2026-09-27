@@ -137,6 +137,14 @@ def test_user1_budget_and_commute_scene():
     assert profile["currency"] == "元"
     names = [scene["scene_name"] for scene in profile["scenes"]]
     assert any("通勤" in name for name in names)
+    # 「咖啡馆办公」是一个场景，不再拆成咖啡馆 + 办公
+    assert "咖啡馆办公" in names
+    assert "咖啡馆" not in names
+    assert "办公" not in names
+    commute = profile["scenes"][0]
+    assert "通勤" in commute["scene_name"]
+    assert commute["usage_duration"] and "40分钟" in commute["usage_duration"]
+    assert commute["usage_frequency"] and "每天" in commute["usage_frequency"]
     for scene in profile["scenes"]:
         assert set(scene) == {
             "scene_name", "usage_duration", "usage_frequency",
@@ -145,10 +153,17 @@ def test_user1_budget_and_commute_scene():
         assert scene["scene_name"] in text
         assert scene["scene_evidence"] in text
         assert scene["scene_name"] in scene["scene_evidence"]
-        # 时长、频率不推断（原文虽有「40分钟」「每天」，也不写入）
-        assert scene["usage_duration"] is None
-        assert scene["usage_frequency"] is None
+        if scene["usage_duration"] is not None:
+            assert scene["usage_duration"] in scene["scene_evidence"]
+        if scene["usage_frequency"] is not None:
+            assert scene["usage_frequency"] in scene["scene_evidence"]
+        # 「最近」不是排序措辞，用户 1 不编优先级
         assert scene["priority_basis"] == "优先级未明确"
+        assert scene["scene_priority"] is None
+    assert profile["product_category"] == "耳机"
+    assert profile["product_category"] in text
+    assert profile["desired_product_type"] is None
+    assert any("播客" in item or "放松" in item for item in profile["purchase_purposes"])
     for key in _PROFILE_LIST_KEYS:
         for item in profile[key]:
             assert item in text
@@ -180,6 +195,63 @@ def test_budget_range_upper_and_approximate_patterns():
     assert block["budget_max"] == 2000
     assert block["budget_semantics"] == "区间"
     assert "预算大概在1500-2000元之间" == block["budget_raw"]
+
+
+def test_scene_attributes_stay_literal_without_ranking_cues():
+    """时长频率用原文短语；「最近/最好」不触发优先级；同句复合场景不拆开。"""
+    text = "每天地铁通勤单程40分钟。最近才开始偶尔在咖啡馆办公。最好再有降噪。"
+    profile = deterministic_profile(text)
+    assert profile["scenes"][0]["usage_duration"] == "单程40分钟"
+    assert profile["scenes"][0]["usage_frequency"] == "每天"
+    names = [scene["scene_name"] for scene in profile["scenes"]]
+    assert "咖啡馆办公" in names
+    assert "咖啡馆" not in names
+    cafe = next(scene for scene in profile["scenes"] if scene["scene_name"] == "咖啡馆办公")
+    assert cafe["usage_frequency"] == "偶尔"
+    assert cafe["usage_duration"] is None
+    assert all(scene["priority_basis"] == "优先级未明确" for scene in profile["scenes"])
+    assert all(scene["scene_priority"] is None for scene in profile["scenes"])
+    for scene in profile["scenes"]:
+        if scene["usage_duration"]:
+            assert scene["usage_duration"] in text
+        if scene["usage_frequency"]:
+            assert scene["usage_frequency"] in text
+
+
+def test_purchase_goals_from_sample_users():
+    """用户 3/5 的品类与购买目的取原文；明确类型才填 desired_product_type。"""
+    bundle, _registry, _index = _load()
+    text3 = _user_text(bundle, 3)
+    user3 = deterministic_profile(text3)
+    assert user3["product_category"] == "耳机"
+    assert user3["product_category"] in text3
+    assert user3["desired_product_type"] == "头戴式游戏耳机"
+    assert user3["desired_product_type"] in text3
+    assert any("打游戏" in item for item in user3["purchase_purposes"])
+    assert all(item in text3 for item in user3["purchase_purposes"])
+    game = next(scene for scene in user3["scenes"] if scene["scene_name"] == "游戏")
+    assert game["scene_priority"] == 1
+    assert game["priority_basis"] == "原文主次措辞"
+
+    text4 = _user_text(bundle, 4)
+    user4 = deterministic_profile(text4)
+    assert user4["product_category"] == "耳机"
+    assert any(item in text4 and ("开会" in item or "音乐" in item) for item in user4["purchase_purposes"])
+    assert all(item in text4 for item in user4["purchase_purposes"])
+
+    text5 = _user_text(bundle, 5)
+    user5 = deterministic_profile(text5)
+    assert user5["product_category"] == "耳机"
+    assert user5["product_category"] in text5
+    assert user5["desired_product_type"] == "能在水下听歌的耳机"
+    assert user5["desired_product_type"] in text5
+    assert any("音乐" in item for item in user5["purchase_purposes"])
+    assert all(item in text5 for item in user5["purchase_purposes"])
+    # 「每周去游泳馆3-4次 / 每次游1小时」对不上指定短语，保持空
+    swim = next(scene for scene in user5["scenes"] if scene["scene_name"] == "游泳")
+    assert swim["usage_duration"] is None
+    assert swim["usage_frequency"] is None
+    assert swim["priority_basis"] == "优先级未明确"
 
 
 def test_sample_users_budget_follow_source_text():

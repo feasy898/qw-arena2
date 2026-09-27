@@ -5,10 +5,13 @@
 提取不到的保持空形态（渲染层落「未提供」），不编造数值、单位或品牌型号。
 
 - deterministic_profile：画像键与 profile_extractor.extract_profile_bundle 的画像半边一致。
+  场景时长/频率只收指定短语；优先级只在同句有明确主次措辞时填写；
+  品类、期望类型与购买目的同样只收原文里已经写出的词。
 - deterministic_product_draft：键集与 product_extractor.empty_draft 一致。
   品牌/型号在草稿里是身份标量；货架其余列与官网键值行写入 observation 列表
-  （FactCell 字典形态）。货架事实种类用「有依据归纳」（价格不用「实测观察」，
-  也不用「官网声明」）；官网键值行用「官网声明」。
+  （FactCell 字典形态）。货架展示价的 normalized_value 取单元格纯数字，并用同行
+  平台原文作口径注记，以便和后写入的渠道报价区分。货架事实种类用「有依据归纳」
+  （价格不用「实测观察」，也不用「官网声明」）；官网键值行用「官网声明」。
   媒体报道补渠道报价区间、含主打/采用/搭载/支持的卖点句（宣传表述，只进
   marketing_claims；「不支持」不算）和「在…条件下」；第三方实测只在出现
   「实测/测得/测试中」时记实测观察；
@@ -124,10 +127,44 @@ _FEEDBACK_HEADER_PREDS = (
     ),
 )
 
-# 场景只在原文出现这些词时列出名称，不补时长/频率
+# 场景名只来自这些词。相邻两词拼成更长原文（如「咖啡馆办公」）时只保留长名。
 _SCENE_KEYWORDS = (
     "通勤", "办公", "游泳", "游戏", "运动", "跑步", "健身",
     "学习", "出差", "会议", "图书馆", "宿舍", "咖啡馆", "飞机", "高铁",
+)
+# 时长/频率：只收这些原文短语，不把「每次游1小时」「每周去3-4次」补成规范说法
+_SCENE_DURATION_RE = re.compile(r"单程\d+分钟|往返\d+分钟|每次\d+[-~]?\d*分钟|约\d+小时")
+_SCENE_FREQUENCY_RE = re.compile(r"每天|每周\d+次|日常|周末|平时|偶尔")
+# 「最近/最好/最后」里的「最」不是排序。排序词必须和场景名落在同一分句。
+_PRIORITY_CUE_RE = re.compile(r"主要|首先|核心是|是核心|最(?!近|好|后|终|多)")
+_CLAUSE_SPLIT_RE = re.compile(r"[，,。；;！？!?\n]+")
+_CATEGORY_WORDS = ("耳机", "耳塞", "头戴式", "头戴")
+_DESIRED_TYPE_RE = re.compile(
+    r"骨传导[^，。；\n]{0,8}?耳机"
+    r"|颈挂式[^，。；\n]{0,8}?耳机"
+    r"|头戴式[^，。；\n]{0,8}?耳机"
+    r"|入耳式[^，。；\n]{0,8}?耳机"
+    r"|挂耳式[^，。；\n]{0,8}?耳机"
+    r"|能在水下听歌的耳机"
+    r"|游泳耳机"
+    r"|骨传导|颈挂式|头戴式|入耳式|挂耳式|开放式"
+)
+_PURPOSE_RES = (
+    re.compile(r"听{1,2}播客和音乐"),
+    re.compile(r"听{1,2}播客"),
+    re.compile(r"听{1,2}音乐"),
+    re.compile(r"听{1,2}歌"),
+    re.compile(r"听{1,2}网课"),
+    re.compile(r"学习视频"),
+    re.compile(r"开电话会议"),
+    re.compile(r"打电话"),
+    re.compile(r"打游戏"),
+    re.compile(r"玩游戏"),
+    re.compile(r"缓解枯燥"),
+    re.compile(r"开会"),
+    re.compile(r"办公"),
+    re.compile(r"放松一下|放松"),
+    re.compile(r"学习"),
 )
 _ECOSYSTEM_PHRASES = (
     "封闭系统生态", "封闭系统", "安卓", "Android", "iOS", "苹果", "鸿蒙", "Windows",
@@ -190,8 +227,8 @@ def _status_for(text: str) -> str:
 def deterministic_profile(user_text: str) -> dict:
     """从用户描述原文保守提取画像（无模型、无 needs）。
 
-    只填有原文依据的预算、设备与生态、场景名、明确偏好。
-    场景时长与频率不推断（保持 None，由渲染层落「未提供」）。
+    只填有原文依据的预算、设备与生态、场景、购买目标、明确偏好。
+    场景时长/频率对不上指定短语时保持 None；没有明确主次措辞时不编优先级。
     """
     text = user_text or ""
     profile = {key: None for key in _PROFILE_SCALARS}
@@ -203,6 +240,7 @@ def deterministic_profile(user_text: str) -> dict:
     _fill_budget(profile, text)
     _fill_devices(profile, text)
     _fill_scenes(profile, text)
+    _fill_purchase_goals(profile, text)
     _fill_preferences(profile, text)
     return profile
 
@@ -279,32 +317,170 @@ def _fill_devices(profile: dict, text: str) -> None:
                 break
 
 
-def _fill_scenes(profile: dict, text: str) -> None:
-    hits = []
-    for keyword in _SCENE_KEYWORDS:
-        index = text.find(keyword)
-        if index >= 0:
-            hits.append((index, keyword))
-    hits.sort()
-    scenes = []
+def _compound_scene_names(text: str) -> list[str]:
+    """两个场景词在原文里紧挨着（咖啡馆+办公）时，长名才是一个场景。"""
+    found = []
+    for left in _SCENE_KEYWORDS:
+        for right in _SCENE_KEYWORDS:
+            if left == right:
+                continue
+            phrase = left + right
+            if phrase in text and phrase not in found:
+                found.append(phrase)
+    return found
+
+
+def _embedded_component(text: str, index: int, name: str, compounds: list[str]) -> bool:
+    """短场景词已经并进更长场景名时，别再把「学习视频」里的「学习」单列。"""
+    if not any(name != compound and name in compound for compound in compounds):
+        return False
+    end = index + len(name)
+    if end >= len(text) or not ("\u4e00" <= text[end] <= "\u9fff"):
+        return False
+    return not any(text.startswith(compound, index) for compound in compounds)
+
+
+def _scene_mentions(text: str) -> list[tuple[int, str]]:
+    """按出现顺序给出不重叠的场景名。长名占住的字，短名不再单列。"""
+    compounds = _compound_scene_names(text)
+    names = sorted(
+        set(compounds) | set(_SCENE_KEYWORDS),
+        key=lambda name: (-len(name), text.find(name), name),
+    )
+    occupied: list[tuple[int, int]] = []
+    found: list[tuple[int, str]] = []
+    for name in names:
+        start = 0
+        while True:
+            index = text.find(name, start)
+            if index < 0:
+                break
+            end = index + len(name)
+            overlapped = any(index < right and end > left for left, right in occupied)
+            if not overlapped and not _embedded_component(text, index, name, compounds):
+                occupied.append((index, end))
+                found.append((index, name))
+            start = index + 1
+    found.sort()
     seen = set()
-    for _index, keyword in hits:
-        if keyword in seen:
+    mentions = []
+    for index, name in found:
+        if name in seen:
             continue
-        seen.add(keyword)
-        evidence = keyword
+        seen.add(name)
+        mentions.append((index, name))
+    return mentions
+
+
+def _phrase_near(sentence: str, anchor: str, pattern: re.Pattern) -> str | None:
+    """取锚点所在句里、离锚点最近的一处匹配；紧挨着的多条频率词连成原文。"""
+    if not sentence or anchor not in sentence:
+        return None
+    matches = list(pattern.finditer(sentence))
+    if not matches:
+        return None
+    groups = [[matches[0]]]
+    for match in matches[1:]:
+        if match.start() == groups[-1][-1].end():
+            groups[-1].append(match)
+        else:
+            groups.append([match])
+    anchor_at = sentence.find(anchor)
+    anchor_end = anchor_at + len(anchor)
+
+    def _distance(group) -> tuple[int, int]:
+        start = group[0].start()
+        end = group[-1].end()
+        if end <= anchor_at:
+            return anchor_at - end, start
+        if start >= anchor_end:
+            return start - anchor_end, start
+        return 0, start
+
+    best = min(groups, key=_distance)
+    phrase = sentence[best[0].start():best[-1].end()]
+    if phrase not in sentence:
+        return None
+    return phrase
+
+
+def _scene_is_primary(text: str, scene_name: str) -> bool:
+    """排序措辞和场景名在同一分句才算主次；「最近/最好」不算。"""
+    if not scene_name:
+        return False
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if scene_name in clause and _PRIORITY_CUE_RE.search(clause):
+            return True
+    return False
+
+
+def _fill_scenes(profile: dict, text: str) -> None:
+    scenes = []
+    for _index, name in _scene_mentions(text):
+        evidence = name
         for sentence in _sentences(text):
-            if keyword in sentence:
+            if name in sentence:
                 evidence = sentence
                 break
-        if evidence not in text:
-            evidence = keyword
+        if evidence not in text or name not in evidence:
+            evidence = name
+        duration = _phrase_near(evidence, name, _SCENE_DURATION_RE)
+        frequency = _phrase_near(evidence, name, _SCENE_FREQUENCY_RE)
+        if duration and duration not in text:
+            duration = None
+        if frequency and frequency not in text:
+            frequency = None
         scene = {key: None for key in _SCENE_KEYS}
-        scene["scene_name"] = keyword
-        scene["priority_basis"] = "优先级未明确"
+        scene["scene_name"] = name
+        scene["usage_duration"] = duration
+        scene["usage_frequency"] = frequency
         scene["scene_evidence"] = evidence
+        if _scene_is_primary(text, name):
+            # 同一处主次措辞覆盖到的场景并列记 1，不在它们之间编造先后
+            scene["scene_priority"] = 1
+            scene["priority_basis"] = "原文主次措辞"
+        else:
+            scene["priority_basis"] = "优先级未明确"
         scenes.append(scene)
     profile["scenes"] = scenes
+
+
+def _desired_product_type(text: str) -> str | None:
+    matches = [match.group(0) for match in _DESIRED_TYPE_RE.finditer(text)]
+    matches = [item for item in matches if item and item in text and item != "耳机"]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (-len(item), text.find(item)))
+    return matches[0]
+
+
+def _purchase_purposes(text: str) -> list[str]:
+    spans = []
+    for pattern in _PURPOSE_RES:
+        for match in pattern.finditer(text):
+            phrase = match.group(0)
+            if phrase and phrase in text:
+                spans.append((match.start(), match.end(), phrase))
+    kept = []
+    for start, end, phrase in spans:
+        if any(other_start <= start and end <= other_end and (other_start, other_end) != (start, end)
+               for other_start, other_end, _phrase in spans):
+            continue
+        kept.append((start, phrase))
+    purposes = []
+    for _start, phrase in sorted(kept, key=lambda item: item[0]):
+        if phrase not in purposes:
+            purposes.append(phrase)
+    return purposes
+
+
+def _fill_purchase_goals(profile: dict, text: str) -> None:
+    for word in _CATEGORY_WORDS:
+        if word in text:
+            profile["product_category"] = word
+            break
+    profile["desired_product_type"] = _desired_product_type(text)
+    profile["purchase_purposes"] = _purchase_purposes(text)
 
 
 def _pref_bucket(atom: str) -> str:
@@ -593,7 +769,10 @@ def _fill_listing(draft: dict, record, cache: dict) -> str:
             record, span_id, channel, fact_kind=_KIND_LISTING, raw_value=channel,
         ))
 
-    _append_price(draft, record, span_id, "current_price", values["price"], headers["price"])
+    # 展示价单元格只有数字。同行平台名是原文，用来标明这是货架展示价口径，
+    # 与后写入的渠道报价区间区分（决策只把带该注记的数字当展示价）。
+    _append_price(draft, record, span_id, "current_price", values["price"], headers["price"],
+                  scope_note=values["platform"])
     _append_price(draft, record, span_id, "original_price", values["original"], headers["original"])
 
     sales = values["sales"]
@@ -614,13 +793,20 @@ def _model_compatible(candidate: str, registered) -> bool:
     return registered_form in candidate_form or candidate_form in registered_form
 
 
-def _append_price(draft, record, span_id, field_key, cell, header_name) -> None:
-    if not cell or cell not in (getattr(record, "original_text", "") or ""):
+def _append_price(draft, record, span_id, field_key, cell, header_name,
+                  scope_note: str | None = None) -> None:
+    text = getattr(record, "original_text", "") or ""
+    if not cell or cell not in text:
         return
     unit = "元" if header_name and "元" in header_name else None
+    number = _number(cell)
+    conditions = []
+    note = (scope_note or "").strip()
+    if note and note in text and note not in cell:
+        conditions.append(note)
     _append_obs(draft, field_key, _observation(
         record, span_id, cell, fact_kind=_KIND_LISTING, raw_value=cell,
-        unit=unit, normalized_value=_number(cell),
+        unit=unit, normalized_value=number, conditions=conditions or None,
     ))
 
 
