@@ -74,7 +74,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.4.8"
+VERSION = "0.4.11"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -575,6 +575,11 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
         # 修复动作：缺口登记 → 上游重查 → 更新归并终稿（下一轮重新冻结/决策）
         # 只重查「必须字段缺口」产品（审计修复：非必填缺口仅登记日志不触发重查，
         # 无必须缺口时不盲目重查全部产品——重查无法补齐资料确无的字段，徒耗 token）
+        if degrade_template:
+            # v0.4.11（grok 第二意见）：已进确定性降级后修复环不再调模型——
+            # 重查只会重复同样的网关失败，徒增耗时
+            logger.warning("修复循环跳过：模型路径已降级（确定性产出保留）")
+            break
         targets = sorted({gap["canonical_id"] for gap in gaps if gap.get("canonical_id")})
         if not targets:
             logger.warning("修复循环 %d/%d：无必须字段缺口可定点重查，跳过重查（保留当前产出）",
@@ -602,6 +607,18 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
         raise ValueError(
             f"修复循环用尽（{attempts} 轮）仍有 {len(highs)} 项 high 级校验未通过：\n{detail}")
     assert bundle is not None
+    if degrade_template:
+        # v0.4.11（grok 第二意见）：降级现场写进产物顶部 HTML 注释（不含密钥），
+        # 平台侧任何人工/日志回看通道都能定位到具体异常类型与网关主机
+        try:
+            diag = ("<!-- degrade: model-path unavailable; "
+                    f"gateway={getattr(gateway, '_base_url', None) or 'n/a'}; "
+                    f"elapsed={budget.elapsed_seconds():.0f}s; "
+                    f"mock={gateway.mock_mode if gateway is not None else 'gw-none'} -->\n")
+            bundle = OutputBundle(diag + bundle.user_profile_md,
+                                  bundle.product_list_md, bundle.recommendation_md)
+        except Exception:
+            pass
     logger.info("运行完成 耗时=%.2fs token≈%d 输出=%s",
                 budget.elapsed_seconds(), budget.total_tokens,
                 [Path(p).name for p in write_outputs(bundle, output_dir)])

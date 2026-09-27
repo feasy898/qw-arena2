@@ -42,6 +42,7 @@ def _clean_env(monkeypatch):
 
 def base_config(**overrides) -> dict:
     config = {
+        "gateway_probe": False,  # v0.4.9：单测默认关探测（探测会消耗 FakeSession 序列）
         "default_model": "qwen3.6-plus",
         "fallback_models": ["qwen3.6-flash"],
         "api_mode": "openai_compatible",
@@ -474,12 +475,22 @@ def test_chat_rejects_empty_or_malformed_messages(monkeypatch):
         gateway.chat([{"role": "user"}], "qwen3.6-plus", mock_key="unit_greeting")
 
 
-def test_real_mode_requires_openai_base_url_suffix(monkeypatch):
+def test_real_mode_openai_base_url_lenient_and_derived(monkeypatch):
+    """v0.4.10：URL 解析彻底容错（平台评测联调——历史 raise 行为与最初 5 发
+    「未正常启动」及 ~25s 降级链吻合；官方工具自述不保证与平台一致）。
+    ① 非 /v1 结尾原样接受；② 缺失时从 DASHSCOPE_BASE_URL 推导兼容端点；
+    ③ 都缺失时回退官方公开兼容地址。"""
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode")
-    with pytest.raises(GatewayError) as excinfo:
-        ModelGateway(base_config())
-    assert "/v1" in str(excinfo.value)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gw.example.com/compatible-mode")
+    gw = ModelGateway(base_config())
+    assert gw._base_url == "https://gw.example.com/compatible-mode"
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://ds.example.com/api/v1")
+    gw = ModelGateway(base_config())
+    assert gw._base_url == "https://ds.example.com/compatible-mode/v1"
+    monkeypatch.delenv("DASHSCOPE_BASE_URL", raising=False)
+    gw = ModelGateway(base_config())
+    assert gw._base_url.endswith("/compatible-mode/v1")
 
 
 def test_real_mode_requires_api_key(monkeypatch):
@@ -509,3 +520,44 @@ def test_connection_error_switches_base_url_candidate(monkeypatch):
     # 两次调用的 url 不同（第二个是官方默认候选）
     assert fake.calls[0]["url"] != fake.calls[1]["url"]
     assert fake.calls[1]["url"].endswith("/chat/completions")
+
+
+# ---------- v0.4.9：启动探测矩阵（gateway_probe 默认开） ----------
+
+def test_probe_matrix_locks_first_working_combo(monkeypatch):
+    """env URL 401（Key 无效）→ 换官方默认 URL，flash 探测 200 → 锁定组合，
+    后续 chat 直接用官方 URL + 探测模型。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-fake-gateway.invalid/v1")
+    gateway = ModelGateway(base_config(gateway_probe=True))
+    fake = FakeSession([
+        FakeResponse(401, {"error": {"code": "InvalidApiKey", "message": "bad key"}}),
+        FakeResponse(200, _ok_body("ok")),          # 官方 URL + plus + enable_thinking
+        FakeResponse(200, _ok_body("{\"ok\": 1}")),
+    ])
+    gateway._session = fake
+    sleeps: list[float] = []
+    gateway._sleep = sleeps.append
+    gateway._rand = lambda: 0.0
+    out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert out["content"] == "{\"ok\": 1}"
+    # 第1次=探测(env,401)；第2次=探测(official,200)；第3次=正式调用(official)
+    assert fake.calls[0]["url"].startswith("https://env-fake-gateway.invalid")
+    assert fake.calls[1]["url"] != fake.calls[0]["url"]
+    assert fake.calls[2]["url"] == fake.calls[1]["url"]
+    assert sleeps == []  # 探测不 sleep
+
+
+def test_probe_all_fail_keeps_default(monkeypatch):
+    """探测全失败（网络异常）→ 保持默认组合，正式调用按原回退逻辑。"""
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-fake-gateway.invalid/v1")
+    gateway = ModelGateway(base_config(gateway_probe=True))
+    probe_fails = [requests.exceptions.ConnectionError("refused")] * 8
+    fake = FakeSession(probe_fails + [FakeResponse(200, _ok_body("fine"))])
+    gateway._session = fake
+    gateway._sleep = lambda _s: None
+    gateway._rand = lambda: 0.0
+    out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert out["content"] == "fine"
+    assert len(fake.calls) > 8  # 探测多发 + 正式调用
