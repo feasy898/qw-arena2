@@ -9,6 +9,10 @@
   品牌/型号在草稿里是身份标量；货架其余列与官网键值行写入 observation 列表
   （FactCell 字典形态）。货架事实种类用「有依据归纳」（价格不用「实测观察」，
   也不用「官网声明」）；官网键值行用「官网声明」。
+  媒体报道补渠道报价区间、含主打/采用/搭载/支持的卖点句（宣传表述，只进
+  marketing_claims；「不支持」不算）和「在…条件下」；第三方实测只在出现
+  「实测/测得/测试中」时记实测观察；
+  用户反馈按原文关键词归入好评/槽点，样本不足 2 条时在 feedback_sample_note 注明。
 """
 from __future__ import annotations
 
@@ -40,8 +44,14 @@ _SCENE_KEYS = (
 
 _KIND_LISTING = FactKind.INFERRED.value          # 有依据归纳
 _KIND_OFFICIAL = FactKind.OFFICIAL_CLAIM.value   # 官网声明
+_KIND_MEASURED = FactKind.MEASURED.value         # 实测观察
+_KIND_MARKETING = FactKind.MARKETING.value       # 宣传表述
+_KIND_FEEDBACK = FactKind.USER_FEEDBACK.value    # 用户反馈
 _STATUS_OK = FactStatus.SUPPORTED.value
 _STATUS_COND = FactStatus.CONDITIONAL.value
+_THIRD_PARTY_COND = "第三方实测"
+_SAMPLE_SHORT_NOTE = "样本不足，不构成共性"
+_SAMPLE_UNKNOWN_NOTE = "代表性未知，不能推及整体"
 
 _BUDGET_RE = re.compile(
     r"(?:预算)?"
@@ -74,8 +84,45 @@ _BATTERY_RE = re.compile(
 )
 _CONDITIONAL_RE = re.compile(r"未披露|未查到|待核验|须查|不以外推|无统一口径|未完整")
 _PAGE_DATE_RE = re.compile(r"页面日期[:：]\s*(\d{4}-\d{2}-\d{2})")
+_SOURCE_DATE_RE = re.compile(
+    r"(?:发布日期|测试日期|页面日期)[:：]\s*(\d{4}-\d{2}-\d{2})"
+)
 _PRODUCT_ID_RE = re.compile(r"P\d{1,3}")
 _WS_RE = re.compile(r"\s+")
+_PRICE_CONTEXT_RE = re.compile(r"报价|价格|售价|价位")
+_PRICE_RANGE_RE = re.compile(
+    r"(?P<low>\d+(?:\.\d+)?)\s*[-—~～－至到]\s*(?P<high>\d+(?:\.\d+)?)\s*元"
+)
+_CLAIM_WORD_RE = re.compile(r"主打|采用|搭载|(?<!不)支持")
+_COND_PHRASE_RE = re.compile(r"在[^。！？\n；]{1,40}?条件下")
+_MEASURED_WORD_RE = re.compile(r"实测|测得")
+_REVIEW_SENSE_RE = re.compile(r"实测|测试中")
+_DURATION_RE = re.compile(r"(?:最长\s*)?约?\s*\d+(?:\.\d+)?\s*小时")
+_PAREN_RE = re.compile(r"（([^）]{1,30})）")
+_NEG_BEFORE_RE = re.compile(r"(?:不会|没有|不太|不怎么|并不|不|没|无|未).{0,2}$")
+_PRAISE_HAO_RE = re.compile(r"好(?!像|比|歹)")
+_COMPLAINT_RES = (
+    re.compile(r"失望"),
+    re.compile(r"差(?!别|距|异|不多|点)"),
+    re.compile(r"(?<![判果诊])断(?!定|层|句)"),
+    re.compile(r"坏"),
+    re.compile(r"闷"),
+    re.compile(r"疼"),
+    re.compile(r"痛"),
+)
+_PRAISE_WORDS = ("满意", "不错", "舒服", "舒适", "清晰", "喜欢", "推荐")
+_BATTERY_MODES = ("未区分模式", "蓝牙模式", "MP3模式", "内存模式", "本地MP3")
+_FEEDBACK_HEADER_PREDS = (
+    lambda name: "反馈内容" in name,
+    lambda name: "反馈摘录" in name,
+    lambda name: "评价原文" in name,
+    lambda name: "评价内容" in name,
+    lambda name: name in {"评价", "评论", "内容", "原文"},
+    lambda name: (
+        any(token in name for token in ("反馈", "评价", "评论"))
+        and not any(token in name for token in ("时间", "日期", "ID", "编号"))
+    ),
+)
 
 # 场景只在原文出现这些词时列出名称，不补时长/频率
 _SCENE_KEYWORDS = (
@@ -347,6 +394,13 @@ def deterministic_product_draft(record, source_records_for_product) -> dict:
     for source in records:
         if _source_is(source, SourceType.OFFICIAL_SITE):
             _fill_official(draft, source)
+    for source in records:
+        if _source_is(source, SourceType.MEDIA_COVERAGE):
+            _fill_media(draft, source)
+    for source in records:
+        if _source_is(source, SourceType.THIRD_PARTY_REVIEW):
+            _fill_review(draft, source)
+    _fill_feedback(draft, records, header_cache)
     # 无官网型号块时，货架「型号」列原文可作身份型号（须与登记值相容）
     if not draft.get("product_name") and listing_model:
         if _model_compatible(listing_model, draft.get("model")):
@@ -750,3 +804,360 @@ def _append_storage(draft, record, span_id, clause, as_of) -> None:
         record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
         unit=unit, normalized_value=amount, status=_status_for(clause), as_of=as_of,
     ))
+
+
+# ---------------------------------------------------------------------------
+# 媒体报道 / 第三方实测 / 用户反馈
+# ---------------------------------------------------------------------------
+
+def _source_date(text: str):
+    match = _SOURCE_DATE_RE.search(text or "")
+    if match and match.group(1) in (text or ""):
+        return match.group(1)
+    return None
+
+
+def _iter_lines(record):
+    text = getattr(record, "original_text", "") or ""
+    for span_id, start, end in _spans_of(record):
+        line = text[start:end]
+        if line.strip():
+            yield span_id, line
+
+
+def _paren_notes(snippet: str) -> list[str]:
+    notes = []
+    for match in _PAREN_RE.finditer(snippet or ""):
+        note = match.group(1).strip()
+        if note and note not in notes:
+            notes.append(note)
+    return notes
+
+
+def _price_snippets(line: str) -> list[str]:
+    """渠道报价区间原文（语境词与「数字-数字元」同句；提取不到返回空）。"""
+    found = []
+    for sentence in _sentences(line):
+        if sentence not in line or not _PRICE_CONTEXT_RE.search(sentence):
+            continue
+        for match in _PRICE_RANGE_RE.finditer(sentence):
+            left = max(0, match.start() - 30)
+            before = list(_PRICE_CONTEXT_RE.finditer(sentence, left, match.end()))
+            if before:
+                start = before[-1].start()
+                if sentence[max(0, start - 2):start] == "渠道":
+                    start -= 2
+            elif _PRICE_CONTEXT_RE.search(sentence, match.end(), match.end() + 16):
+                start = match.start()
+            else:
+                continue
+            end = match.end()
+            paren = re.match(r"（[^）]{1,30}）", sentence[end:])
+            if paren:
+                end += paren.end()
+            snippet = sentence[start:end]
+            if snippet and snippet in line and snippet not in found:
+                found.append(snippet)
+    return found
+
+
+def _claim_snippets(line: str) -> list[str]:
+    """含主打/采用/搭载/支持（不含「不支持」）的原文分句。"""
+    found = []
+    for sentence in _sentences(line):
+        if sentence not in line:
+            continue
+        pieces = [part.strip() for part in re.split(r"[；;]", sentence) if part.strip()]
+        hits = [part for part in pieces if part in line and _CLAIM_WORD_RE.search(part)]
+        if not hits and _CLAIM_WORD_RE.search(sentence) and sentence in line:
+            hits = [sentence]
+        for hit in hits:
+            if hit not in found:
+                found.append(hit)
+    return found
+
+
+def _condition_hits(line: str) -> list[tuple[str, str]]:
+    """返回 (所在句, 「在…条件下」短语)。"""
+    found = []
+    seen = set()
+    for sentence in _sentences(line):
+        if sentence not in line:
+            continue
+        for match in _COND_PHRASE_RE.finditer(sentence):
+            phrase = match.group(0)
+            if phrase in sentence and phrase not in seen:
+                seen.add(phrase)
+                found.append((sentence, phrase))
+    return found
+
+
+def _condition_field(sentence: str) -> str:
+    if "降噪" in sentence:
+        return "noise_cancellation"
+    if any(token in sentence for token in ("音质", "听感", "音色")):
+        return "acoustic_tech"
+    if any(token in sentence for token in ("防水", "水深", "浸水", "水下", "淋雨")):
+        return "waterproof_conditions"
+    if "充电" in sentence or "快充" in sentence:
+        return "charging"
+    if "蓝牙" in sentence:
+        return "bluetooth"
+    if "佩戴" in sentence:
+        return "wearing_design"
+    if _DURATION_RE.search(sentence) and any(token in sentence for token in ("续航", "播放", "小时")):
+        return "battery_by_mode"
+    return "special_features"
+
+
+def _mode_before(text: str, index: int):
+    before = text[:index]
+    found = None
+    found_at = -1
+    for candidate in _BATTERY_MODES:
+        pos = before.rfind(candidate)
+        if pos > found_at:
+            found_at = pos
+            found = candidate
+    return found
+
+
+def _fill_media(draft: dict, record) -> None:
+    text = getattr(record, "original_text", "") or ""
+    as_of = _source_date(text)
+    for span_id, line in _iter_lines(record):
+        for snippet in _price_snippets(line):
+            _append_obs(draft, "current_price", _observation(
+                record, span_id, snippet, fact_kind=_KIND_LISTING, raw_value=snippet,
+                unit="元", status=_STATUS_OK, as_of=as_of,
+                conditions=_paren_notes(snippet),
+            ))
+        for snippet in _claim_snippets(line):
+            _append_obs(draft, "marketing_claims", _observation(
+                record, span_id, snippet, fact_kind=_KIND_MARKETING,
+                items=[snippet], status=_STATUS_OK, as_of=as_of,
+            ))
+        for sentence, phrase in _condition_hits(line):
+            field_key = _condition_field(sentence)
+            conditions = [phrase]
+            if field_key == "battery_by_mode":
+                dur = _DURATION_RE.search(sentence)
+                if not dur or dur.group(0) not in sentence:
+                    field_key = "special_features"
+                else:
+                    _append_obs(draft, field_key, _observation(
+                        record, span_id, sentence, fact_kind=_KIND_LISTING,
+                        raw_value=dur.group(0),
+                        unit="小时" if "小时" in dur.group(0) else None,
+                        status=_STATUS_COND, as_of=as_of, conditions=conditions,
+                        applicable_variant=_mode_before(sentence, dur.start()),
+                    ))
+                    continue
+            if field_key == "special_features":
+                _append_obs(draft, field_key, _observation(
+                    record, span_id, sentence, fact_kind=_KIND_LISTING,
+                    items=[sentence], status=_STATUS_COND, as_of=as_of,
+                    conditions=conditions,
+                ))
+            else:
+                _append_obs(draft, field_key, _observation(
+                    record, span_id, sentence, fact_kind=_KIND_LISTING,
+                    raw_value=sentence, status=_STATUS_COND, as_of=as_of,
+                    conditions=conditions,
+                ))
+
+
+def _fill_review(draft: dict, record) -> None:
+    text = getattr(record, "original_text", "") or ""
+    as_of = _source_date(text)
+    for span_id, line in _iter_lines(record):
+        for sentence in _sentences(line):
+            if sentence not in line:
+                continue
+            _append_measured_battery(draft, record, span_id, sentence, as_of)
+            _append_measured_sense(draft, record, span_id, sentence, as_of)
+
+
+def _append_measured_battery(draft, record, span_id, sentence, as_of) -> None:
+    """仅「实测/测得」与时长同句才记续航；转述规格不升级为实测。"""
+    if not _MEASURED_WORD_RE.search(sentence):
+        return
+    for match in _DURATION_RE.finditer(sentence):
+        duration = match.group(0)
+        if duration not in sentence:
+            continue
+        conditions = [_THIRD_PARTY_COND]
+        for note in _paren_notes(sentence):
+            if note not in conditions:
+                conditions.append(note)
+        amount = None
+        number = re.search(r"\d+(?:\.\d+)?", duration)
+        if number:
+            amount = _number(number.group(0))
+        _append_obs(draft, "battery_by_mode", _observation(
+            record, span_id, sentence, fact_kind=_KIND_MEASURED,
+            raw_value=duration, unit="小时" if "小时" in duration else None,
+            normalized_value=amount, status=_STATUS_COND, as_of=as_of,
+            conditions=conditions,
+            applicable_variant=_mode_before(sentence, match.start()),
+        ))
+
+
+def _append_measured_sense(draft, record, span_id, sentence, as_of) -> None:
+    """含「实测/测试中」的降噪或音质句，落到对应产品力字段，附条件。"""
+    if not _REVIEW_SENSE_RE.search(sentence):
+        return
+    if "降噪" in sentence:
+        field_key = "noise_cancellation"
+    elif any(token in sentence for token in ("音质", "听感", "音色", "低音")):
+        field_key = "acoustic_tech"
+    else:
+        return
+    _append_obs(draft, field_key, _observation(
+        record, span_id, sentence, fact_kind=_KIND_MEASURED,
+        raw_value=sentence, status=_STATUS_COND, as_of=as_of,
+        conditions=[_THIRD_PARTY_COND],
+    ))
+
+
+def _negated_at(clause: str, index: int) -> bool:
+    prefix = clause[max(0, index - 8):index]
+    return bool(_NEG_BEFORE_RE.search(prefix))
+
+
+def _has_active_keyword(clause: str, words: tuple[str, ...]) -> bool:
+    for word in sorted(words, key=len, reverse=True):
+        start = 0
+        while True:
+            index = clause.find(word, start)
+            if index < 0:
+                break
+            if not _negated_at(clause, index):
+                return True
+            start = index + len(word)
+    return False
+
+
+def _has_active_pattern(clause: str, pattern: re.Pattern) -> bool:
+    return any(not _negated_at(clause, match.start()) for match in pattern.finditer(clause))
+
+
+def _is_praise(clause: str) -> bool:
+    return _has_active_keyword(clause, _PRAISE_WORDS) or _has_active_pattern(clause, _PRAISE_HAO_RE)
+
+
+def _is_complaint(clause: str) -> bool:
+    for pattern in _COMPLAINT_RES:
+        if _has_active_pattern(clause, pattern):
+            return True
+    return False
+
+
+def _review_clauses(review: str) -> list[str]:
+    parts = re.split(r"[，,。！？!?；;\n]+", review or "")
+    clauses = []
+    for part in parts:
+        clause = part.strip()
+        if len(clause) >= 2 and clause in review and clause not in clauses:
+            clauses.append(clause)
+    return clauses
+
+
+def _bucket_clauses(review: str) -> tuple[list[str], list[str]]:
+    praise, complaints = [], []
+    for clause in _review_clauses(review):
+        if _is_praise(clause) and clause not in praise:
+            praise.append(clause)
+        if _is_complaint(clause) and clause not in complaints:
+            complaints.append(clause)
+    return praise, complaints
+
+
+def _feedback_column(header, cells) -> str:
+    if not header:
+        return ""
+    for predicate in _FEEDBACK_HEADER_PREDS:
+        for index, name in enumerate(header):
+            if not predicate(name.strip()):
+                continue
+            if index >= len(cells):
+                return ""
+            return cells[index].strip()
+    return ""
+
+
+def _feedback_as_of(header, cells, text: str):
+    if not header:
+        return None
+    for index, name in enumerate(header):
+        if index >= len(cells):
+            continue
+        if any(token in name for token in ("时间", "日期")):
+            token = cells[index].strip()
+            if token and token in text and re.search(r"\d{4}", token):
+                return token
+    return None
+
+
+def _feedback_review(record, cache):
+    text = getattr(record, "original_text", "") or ""
+    if not text.strip():
+        return None
+    cells = csv_cells(text)
+    header = _listing_header(record, cache)
+    review = _feedback_column(header, cells)
+    if not review or review not in text:
+        return None
+    if re.fullmatch(r"[\d/\-:\s.]+", review):
+        return None
+    span_id = _row_span(record)
+    if not span_id:
+        return None
+    return span_id, review, _feedback_as_of(header, cells, text)
+
+
+def _feedback_conditions(row_count: int, bucket_rows: int) -> list[str]:
+    if row_count < 2 or bucket_rows < 2:
+        return [_SAMPLE_SHORT_NOTE]
+    return [_SAMPLE_UNKNOWN_NOTE]
+
+
+def _fill_feedback(draft: dict, records, cache: dict) -> None:
+    parsed = []
+    for record in records or []:
+        if not _source_is(record, SourceType.USER_FEEDBACK):
+            continue
+        got = _feedback_review(record, cache)
+        if not got:
+            continue
+        span_id, review, as_of = got
+        praise, complaints = _bucket_clauses(review)
+        parsed.append((record, span_id, review, praise, complaints, as_of))
+    if not parsed:
+        return
+    row_count = len(parsed)
+    praise_rows = sum(1 for row in parsed if row[3])
+    complaint_rows = sum(1 for row in parsed if row[4])
+    note_conditions = (
+        [_SAMPLE_SHORT_NOTE] if row_count < 2 else [_SAMPLE_UNKNOWN_NOTE]
+    )
+    praise_conditions = _feedback_conditions(row_count, praise_rows)
+    complaint_conditions = _feedback_conditions(row_count, complaint_rows)
+    for record, span_id, review, praise, complaints, as_of in parsed:
+        if praise:
+            _append_obs(draft, "common_praise", _observation(
+                record, span_id, review, fact_kind=_KIND_FEEDBACK,
+                items=praise, status=_STATUS_COND, as_of=as_of,
+                conditions=praise_conditions,
+            ))
+        if complaints:
+            _append_obs(draft, "common_complaints", _observation(
+                record, span_id, review, fact_kind=_KIND_FEEDBACK,
+                items=complaints, status=_STATUS_COND, as_of=as_of,
+                conditions=complaint_conditions,
+            ))
+        _append_obs(draft, "feedback_sample_note", _observation(
+            record, span_id, review, fact_kind=_KIND_FEEDBACK,
+            raw_value=review, status=_STATUS_COND, as_of=as_of,
+            conditions=list(note_conditions),
+        ))
