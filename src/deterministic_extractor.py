@@ -1,0 +1,752 @@
+# -*- coding: utf-8 -*-
+"""确定性基线抽取器（零模型依赖）。
+
+模型网关不可用时的降级抽取：只填写能在原文中逐字回溯的字段，
+提取不到的保持空形态（渲染层落「未提供」），不编造数值、单位或品牌型号。
+
+- deterministic_profile：画像键与 profile_extractor.extract_profile_bundle 的画像半边一致。
+- deterministic_product_draft：键集与 product_extractor.empty_draft 一致。
+  品牌/型号在草稿里是身份标量；货架其余列与官网键值行写入 observation 列表
+  （FactCell 字典形态）。货架事实种类用「有依据归纳」（价格不用「实测观察」，
+  也不用「官网声明」）；官网键值行用「官网声明」。
+"""
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+from src.input_adapter import InputError, csv_cells, line_spans, read_csv_rows
+from src.schemas import FactKind, FactStatus, SourceType
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_FIELD_CATALOG = _REPO_ROOT / "contracts" / "field_catalog.json"
+
+# 画像键（与 profile_extractor.SCALARS / LISTS / 场景 item 对齐）
+_PROFILE_SCALARS = (
+    "profile_id", "name", "gender", "age", "occupation", "city",
+    "product_category", "desired_product_type", "budget_min", "budget_max",
+    "currency", "budget_raw", "budget_semantics", "ecosystem", "ecosystem_notes",
+)
+_PROFILE_LISTS = (
+    "purchase_purposes", "devices", "brand_preferences", "brand_avoidances",
+    "appearance_preferences", "sound_preferences", "functional_preferences",
+    "service_preferences", "other_preferences",
+)
+_SCENE_KEYS = (
+    "scene_name", "usage_duration", "usage_frequency",
+    "scene_priority", "priority_basis", "scene_evidence",
+)
+
+_KIND_LISTING = FactKind.INFERRED.value          # 有依据归纳
+_KIND_OFFICIAL = FactKind.OFFICIAL_CLAIM.value   # 官网声明
+_STATUS_OK = FactStatus.SUPPORTED.value
+_STATUS_COND = FactStatus.CONDITIONAL.value
+
+_BUDGET_RE = re.compile(
+    r"(?:预算)?"
+    r"\s*(?P<qual>大概|大约|约|不超过|最多|上限)?"
+    r"\s*(?:在)?"
+    r"\s*(?P<n1>\d+(?:\.\d+)?)"
+    r"(?:\s*[-—~～至到]\s*(?P<n2>\d+(?:\.\d+)?))?"
+    r"\s*(?P<unit>元|块)"
+    r"\s*(?P<suffix>左右|上下|以内|以下|之内|之间)?"
+)
+_DEVICE_RE = re.compile(
+    r"(?P<brand>[A-Za-z][A-Za-z0-9]{1,24}|[\u4e00-\u9fff]{2,8})"
+    r"\s*的?\s*(?P<kind>手机|电脑|笔记本|平板)"
+)
+_CAMP_BRAND_RE = re.compile(r"阵营的([\u4e00-\u9fff]{2,8})")
+_PREFERENCE_BRAND_RE = re.compile(r"偏好\s*([^，。；\n]+)")
+_PREFERENCE_VERB_RE = re.compile(
+    r"(?:希望|需要|要求|喜欢|不喜欢|不想)([^，。；\n]{2,40})"
+)
+_PREFERENCE_REQUIRE_RE = re.compile(
+    r"对[^，。；\n]{1,24}?要求[^，。；\n]{0,8}"
+)
+_HEADER_RE = re.compile(r"【([^】]+)】")
+_KV_RE = re.compile(r"(.{2,12})[:：]\s*(.+)")
+_IP_RE = re.compile(r"IPX?\d+(?:/IPX?\d+)*")
+_WEIGHT_RE = re.compile(r"约?\d+(?:\.\d+)?g(?![A-Za-z])")
+_STORAGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB", re.IGNORECASE)
+_BATTERY_RE = re.compile(
+    r"^(?P<mode>.*?)(?P<dur>(?:最长)?约?\d+(?:\.\d+)?\s*小时)$"
+)
+_CONDITIONAL_RE = re.compile(r"未披露|未查到|待核验|须查|不以外推|无统一口径|未完整")
+_PAGE_DATE_RE = re.compile(r"页面日期[:：]\s*(\d{4}-\d{2}-\d{2})")
+_PRODUCT_ID_RE = re.compile(r"P\d{1,3}")
+_WS_RE = re.compile(r"\s+")
+
+# 场景只在原文出现这些词时列出名称，不补时长/频率
+_SCENE_KEYWORDS = (
+    "通勤", "办公", "游泳", "游戏", "运动", "跑步", "健身",
+    "学习", "出差", "会议", "图书馆", "宿舍", "咖啡馆", "飞机", "高铁",
+)
+_ECOSYSTEM_PHRASES = (
+    "封闭系统生态", "封闭系统", "安卓", "Android", "iOS", "苹果", "鸿蒙", "Windows",
+)
+_BRAND_STOP = frozenset({
+    "这类", "海外", "一线", "音频", "品牌", "的", "和", "与", "或", "等", "手机", "耳机",
+})
+_PREF_STOP = frozenset({"一些", "一下", "功能", "产品", "耳机", "可以", "能够"})
+
+# 货架列（表头优先；无表头时仅在列数与编号形态吻合时用样例列序）
+_LISTING_ROLES = (
+    ("brand", lambda name: name == "品牌", 1),
+    ("platform", lambda name: name == "平台", 2),
+    ("shop", lambda name: "店铺" in name, 3),
+    ("title", lambda name: "标题" in name, 4),
+    ("model", lambda name: name == "型号", 5),
+    ("variant", lambda name: ("颜色" in name or "套餐" in name), 6),
+    ("price", lambda name: "展示价" in name, 7),
+    ("original", lambda name: "优惠前" in name, 8),
+    ("sales", lambda name: ("已售" in name or "付款" in name), 9),
+)
+
+_CATALOG_KEYS: list[str] | None = None
+
+
+def _product_field_keys() -> list[str]:
+    """field_catalog.product 全部子字段键（与 empty_draft 同源）。"""
+    global _CATALOG_KEYS
+    if _CATALOG_KEYS is None:
+        catalog = json.loads(_FIELD_CATALOG.read_text(encoding="utf-8"))
+        _CATALOG_KEYS = [
+            field["key"]
+            for group in catalog["product"]["groups"]
+            for field in group["fields"]
+        ]
+    return list(_CATALOG_KEYS)
+
+
+def _identity(text: str) -> str:
+    return _WS_RE.sub("", text or "").casefold()
+
+
+def _number(text: str):
+    if text is None or not re.fullmatch(r"\d+(?:\.\d+)?", str(text)):
+        return None
+    raw = str(text)
+    return float(raw) if "." in raw else int(raw)
+
+
+def _status_for(text: str) -> str:
+    if text and _CONDITIONAL_RE.search(text):
+        return _STATUS_COND
+    return _STATUS_OK
+
+
+# ---------------------------------------------------------------------------
+# 画像
+# ---------------------------------------------------------------------------
+
+def deterministic_profile(user_text: str) -> dict:
+    """从用户描述原文保守提取画像（无模型、无 needs）。
+
+    只填有原文依据的预算、设备与生态、场景名、明确偏好。
+    场景时长与频率不推断（保持 None，由渲染层落「未提供」）。
+    """
+    text = user_text or ""
+    profile = {key: None for key in _PROFILE_SCALARS}
+    for key in _PROFILE_LISTS:
+        profile[key] = []
+    profile["scenes"] = []
+    if not text.strip():
+        return profile
+    _fill_budget(profile, text)
+    _fill_devices(profile, text)
+    _fill_scenes(profile, text)
+    _fill_preferences(profile, text)
+    return profile
+
+
+def _fill_budget(profile: dict, text: str) -> None:
+    matches = [m for m in _BUDGET_RE.finditer(text) if m.group("unit")]
+    if not matches:
+        return
+    chosen = next((m for m in matches if "预算" in m.group(0)), matches[0])
+    raw = chosen.group(0)
+    if raw not in text:
+        return
+    n1 = _number(chosen.group("n1"))
+    n2 = _number(chosen.group("n2")) if chosen.group("n2") else None
+    if n1 is None:
+        return
+    qual = chosen.group("qual") or ""
+    suffix = chosen.group("suffix") or ""
+    if n2 is not None:
+        low, high = (n1, n2) if n1 <= n2 else (n2, n1)
+        profile["budget_min"] = low
+        profile["budget_max"] = high
+        profile["budget_semantics"] = "区间"
+    elif suffix in {"以内", "以下", "之内"} or qual in {"不超过", "最多", "上限"}:
+        profile["budget_max"] = n1
+        profile["budget_semantics"] = "上限"
+    else:
+        # 「约/左右/大概」以及无口径单值：数值仍取该数字，口径不升成硬上限
+        profile["budget_max"] = n1
+        profile["budget_semantics"] = "约(单值)"
+    profile["budget_raw"] = raw
+    # 任务口径把「元/块」都视为预算货币标记；枚举只有「元」
+    profile["currency"] = "元"
+
+
+def _sentences(text: str) -> list[str]:
+    parts = re.split(r"[。！？\n]+", text)
+    return [part.strip() for part in parts if part.strip() and part.strip() in text]
+
+
+def _fill_devices(profile: dict, text: str) -> None:
+    devices: list[str] = []
+
+    def _add(phrase: str) -> None:
+        phrase = (phrase or "").strip()
+        if len(phrase) < 2 or phrase not in text:
+            return
+        if phrase not in devices:
+            devices.append(phrase)
+
+    for match in _DEVICE_RE.finditer(text):
+        _add(match.group(0))
+    for match in _CAMP_BRAND_RE.finditer(text):
+        brand = match.group(1)
+        window = text[max(0, match.start() - 12):match.end() + 24]
+        if "手机" in window or "电脑" in window or "笔记本" in window:
+            _add(brand)
+    profile["devices"] = devices
+
+    found = [phrase for phrase in _ECOSYSTEM_PHRASES if phrase in text]
+    found = [phrase for phrase in found if not any(
+        phrase != other and phrase in other for other in found
+    )]
+    if not found:
+        return
+    if "安卓" in found and any(token in text for token in ("换成", "安卓阵营")):
+        profile["ecosystem"] = "安卓"
+    else:
+        profile["ecosystem"] = found[0]
+    for sentence in _sentences(text):
+        if "换成" in sentence or ("之前" in sentence and "用" in sentence):
+            if any(phrase in sentence for phrase in found) or any(item in sentence for item in devices):
+                profile["ecosystem_notes"] = sentence
+                break
+
+
+def _fill_scenes(profile: dict, text: str) -> None:
+    hits = []
+    for keyword in _SCENE_KEYWORDS:
+        index = text.find(keyword)
+        if index >= 0:
+            hits.append((index, keyword))
+    hits.sort()
+    scenes = []
+    seen = set()
+    for _index, keyword in hits:
+        if keyword in seen:
+            continue
+        seen.add(keyword)
+        evidence = keyword
+        for sentence in _sentences(text):
+            if keyword in sentence:
+                evidence = sentence
+                break
+        if evidence not in text:
+            evidence = keyword
+        scene = {key: None for key in _SCENE_KEYS}
+        scene["scene_name"] = keyword
+        scene["priority_basis"] = "优先级未明确"
+        scene["scene_evidence"] = evidence
+        scenes.append(scene)
+    profile["scenes"] = scenes
+
+
+def _pref_bucket(atom: str) -> str:
+    if any(token in atom for token in ("音质", "低音", "轰头", "听感", "音色")):
+        return "sound_preferences"
+    if any(token in atom for token in ("外观", "浅色", "好看", "颜色", "设计")):
+        return "appearance_preferences"
+    if any(token in atom for token in ("保修", "售后", "客服", "退换")):
+        return "service_preferences"
+    if any(token in atom for token in ("性价比", "耐用", "专业", "品牌没有", "没有特别")):
+        return "other_preferences"
+    if any(token in atom for token in (
+        "降噪", "防水", "防汗", "防点汗", "存储", "麦克风", "通话",
+        "蓝牙", "佩戴", "听声", "辨位", "配合", "安卓", "噪音",
+    )):
+        return "functional_preferences"
+    return "other_preferences"
+
+
+def _add_pref(buckets: dict[str, list[str]], text: str, bucket: str, phrase: str) -> None:
+    phrase = (phrase or "").strip(" ，,、")
+    if len(phrase) < 2 or phrase in _PREF_STOP or phrase not in text:
+        return
+    current = buckets[bucket]
+    if any(phrase == old or phrase in old for old in current):
+        return
+    buckets[bucket] = [old for old in current if old not in phrase]
+    buckets[bucket].append(phrase)
+
+
+def _pref_atoms(clause: str, text: str) -> list[str]:
+    parts = [part.strip() for part in re.split(r"[、]", clause) if part.strip()]
+    if len(parts) <= 1:
+        return [clause.strip()] if clause.strip() in text else []
+    atoms = []
+    for part in parts:
+        if part in text and len(part) >= 2:
+            atoms.append(part)
+    return atoms
+
+
+def _fill_preferences(profile: dict, text: str) -> None:
+    buckets = {key: [] for key in (
+        "brand_preferences", "brand_avoidances", "appearance_preferences",
+        "sound_preferences", "functional_preferences", "service_preferences",
+        "other_preferences",
+    )}
+    brand_match = _PREFERENCE_BRAND_RE.search(text)
+    if brand_match:
+        chunk = brand_match.group(1)
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9]+|[\u4e00-\u9fff]{2,8}", chunk):
+            if token in _BRAND_STOP or token not in text:
+                continue
+            _add_pref(buckets, text, "brand_preferences", token)
+    clauses = []
+    for match in _PREFERENCE_VERB_RE.finditer(text):
+        clauses.append(match.group(0))
+    for match in _PREFERENCE_REQUIRE_RE.finditer(text):
+        clauses.append(match.group(0))
+    for clause in clauses:
+        for atom in _pref_atoms(clause, text):
+            _add_pref(buckets, text, _pref_bucket(atom), atom)
+    for key, values in buckets.items():
+        values.sort(key=lambda item: text.find(item))
+        profile[key] = values
+
+
+# ---------------------------------------------------------------------------
+# 产品草稿
+# ---------------------------------------------------------------------------
+
+def deterministic_product_draft(record, source_records_for_product) -> dict:
+    """从该产品的五源记录做确定性抽取，返回 empty_draft 同构草稿。
+
+    :param record: 产品登记（canonical_id / original_ids / brand_raw / model_raw）
+    :param source_records_for_product: 该产品的 SourceRecord 列表
+    """
+    draft = _empty_product_draft(record)
+    records = list(source_records_for_product or [])
+    header_cache: dict[str, list[str] | None] = {}
+    listing_model = ""
+    for source in records:
+        if _source_is(source, SourceType.ECOMMERCE_LISTING):
+            found = _fill_listing(draft, source, header_cache)
+            if found:
+                listing_model = found
+    for source in records:
+        if _source_is(source, SourceType.OFFICIAL_SITE):
+            _fill_official(draft, source)
+    # 无官网型号块时，货架「型号」列原文可作身份型号（须与登记值相容）
+    if not draft.get("product_name") and listing_model:
+        if _model_compatible(listing_model, draft.get("model")):
+            draft["model"] = listing_model
+    return draft
+
+
+def _empty_product_draft(record) -> dict:
+    draft = {key: [] for key in _product_field_keys()}
+    draft["canonical_id"] = getattr(record, "canonical_id", None)
+    aliases = list(getattr(record, "original_ids", None) or [])
+    draft["aliases"] = sorted(str(alias) for alias in aliases if str(alias).strip())
+    draft["product_name"] = None
+    draft["brand"] = getattr(record, "brand_raw", None)
+    draft["model"] = getattr(record, "model_raw", None)
+    return draft
+
+
+def _source_is(record, source_type: SourceType) -> bool:
+    value = getattr(record, "source_type", None)
+    return value == source_type or str(value) == str(source_type)
+
+
+def _spans_of(record):
+    spans = list(getattr(record, "spans", None) or [])
+    if spans:
+        return spans
+    return line_spans(getattr(record, "original_text", "") or "")
+
+
+def _append_obs(draft: dict, field_key: str, obs: dict | None) -> None:
+    if not obs or not isinstance(draft.get(field_key), list):
+        return
+    signature = (
+        obs.get("raw_value"),
+        tuple(obs.get("items") or ()),
+        obs.get("applicable_variant"),
+    )
+    for existing in draft[field_key]:
+        existing_sig = (
+            existing.get("raw_value"),
+            tuple(existing.get("items") or ()),
+            existing.get("applicable_variant"),
+        )
+        if existing_sig == signature:
+            return
+    draft[field_key].append(obs)
+
+
+def _observation(record, span_id: str, quote: str, *, fact_kind: str,
+                 raw_value=None, items=None, unit=None, normalized_value=None,
+                 status: str | None = None, applicable_variant=None,
+                 as_of=None, conditions=None) -> dict | None:
+    """构造一条 observation。引文或取值不是原文子串时返回 None（宁缺勿造）。"""
+    text = getattr(record, "original_text", "") or ""
+    source_id = getattr(record, "source_id", "") or ""
+    if not source_id or not quote or quote not in text:
+        return None
+    span_text = None
+    for sid, start, end in _spans_of(record):
+        if sid == span_id:
+            span_text = text[start:end]
+            break
+    if span_text is None or quote not in span_text:
+        return None
+    if isinstance(raw_value, str) and raw_value not in text:
+        return None
+    if items is not None:
+        if not items or any(item not in text or item not in quote for item in items):
+            return None
+    if applicable_variant and applicable_variant not in text:
+        applicable_variant = None
+    if as_of and as_of not in text:
+        as_of = None
+    obs = {
+        "fact_kind": fact_kind,
+        "status": status or _STATUS_OK,
+        "conditions": list(conditions or []),
+        "applicable_variant": applicable_variant,
+        "as_of": as_of,
+        "evidence_refs": [{
+            "source_id": source_id,
+            "span_id": span_id,
+            "exact_quote": quote,
+        }],
+    }
+    if items is not None:
+        obs["items"] = list(items)
+    else:
+        obs["raw_value"] = raw_value
+        obs["normalized_value"] = normalized_value
+        obs["unit"] = unit
+    return obs
+
+
+def _listing_header(record, cache: dict) -> list[str] | None:
+    path = getattr(record, "path", None)
+    if not path:
+        return None
+    key = str(path)
+    if key in cache:
+        return cache[key]
+    header = None
+    try:
+        header, _rows = read_csv_rows(path)
+    except (InputError, OSError, ValueError):
+        header = None
+    cache[key] = header
+    return header
+
+
+def _positional_ok(cells: list[str]) -> bool:
+    return len(cells) >= 8 and bool(_PRODUCT_ID_RE.fullmatch(cells[0].strip()))
+
+
+def _listing_cell(header, cells, predicate, fallback_index):
+    """返回 (单元格原文, 表头名或 None)。"""
+    index = None
+    header_name = None
+    if header:
+        for idx, name in enumerate(header):
+            if predicate(name.strip()):
+                index = idx
+                header_name = name.strip()
+                break
+    elif _positional_ok(cells):
+        index = fallback_index
+    if index is None or index >= len(cells):
+        return "", header_name
+    return cells[index].strip(), header_name
+
+
+def _row_span(record):
+    spans = _spans_of(record)
+    if not spans:
+        return None
+    return spans[0][0]
+
+
+def _fill_listing(draft: dict, record, cache: dict) -> str:
+    """抽取货架行。返回型号列原文（没有则为空串）。"""
+    text = getattr(record, "original_text", "") or ""
+    if not text.strip():
+        return ""
+    cells = csv_cells(text)
+    header = _listing_header(record, cache)
+    span_id = _row_span(record)
+    if not span_id:
+        return ""
+    values = {}
+    headers = {}
+    for role, predicate, index in _LISTING_ROLES:
+        cell, header_name = _listing_cell(header, cells, predicate, index)
+        values[role] = cell
+        headers[role] = header_name
+
+    brand = values["brand"]
+    if brand and brand in text:
+        registered = draft.get("brand")
+        if not registered or _identity(brand) == _identity(str(registered)):
+            draft["brand"] = brand
+    listing_model = values["model"] if values["model"] and values["model"] in text else ""
+
+    variant = values["variant"]
+    if variant and variant in text:
+        items = [part.strip() for part in re.split(r"[/、]", variant) if part.strip()]
+        if len(items) <= 1:
+            items = [variant]
+        if all(item in variant for item in items):
+            _append_obs(draft, "variants", _observation(
+                record, span_id, variant, fact_kind=_KIND_LISTING, items=items,
+            ))
+
+    title = values["title"]
+    if title and title in text:
+        _append_obs(draft, "listing_title", _observation(
+            record, span_id, title, fact_kind=_KIND_LISTING, raw_value=title,
+        ))
+
+    platform, shop = values["platform"], values["shop"]
+    channel = None
+    if platform and shop and f"{platform},{shop}" in text:
+        channel = f"{platform},{shop}"
+    elif platform and platform in text:
+        channel = platform
+    elif shop and shop in text:
+        channel = shop
+    if channel:
+        _append_obs(draft, "channel_and_shop", _observation(
+            record, span_id, channel, fact_kind=_KIND_LISTING, raw_value=channel,
+        ))
+
+    _append_price(draft, record, span_id, "current_price", values["price"], headers["price"])
+    _append_price(draft, record, span_id, "original_price", values["original"], headers["original"])
+
+    sales = values["sales"]
+    if sales and sales in text:
+        _append_obs(draft, "sales_volume", _observation(
+            record, span_id, sales, fact_kind=_KIND_LISTING, raw_value=sales,
+        ))
+    return listing_model
+
+
+def _model_compatible(candidate: str, registered) -> bool:
+    if not candidate:
+        return False
+    if not registered:
+        return True
+    registered_form = _identity(str(registered))
+    candidate_form = _identity(candidate)
+    return registered_form in candidate_form or candidate_form in registered_form
+
+
+def _append_price(draft, record, span_id, field_key, cell, header_name) -> None:
+    if not cell or cell not in (getattr(record, "original_text", "") or ""):
+        return
+    unit = "元" if header_name and "元" in header_name else None
+    _append_obs(draft, field_key, _observation(
+        record, span_id, cell, fact_kind=_KIND_LISTING, raw_value=cell,
+        unit=unit, normalized_value=_number(cell),
+    ))
+
+
+def _maybe_set_model(draft: dict, model_name: str) -> None:
+    if not model_name:
+        return
+    registered = draft.get("model")
+    if registered and not _model_compatible(model_name, registered):
+        return
+    draft["model"] = model_name
+    draft["product_name"] = model_name
+
+
+def _page_date(text: str):
+    match = _PAGE_DATE_RE.search(text or "")
+    if match and match.group(1) in text:
+        return match.group(1)
+    return None
+
+
+def _fill_official(draft: dict, record) -> None:
+    text = getattr(record, "original_text", "") or ""
+    as_of = _page_date(text)
+    section = None
+    for span_id, start, end in _spans_of(record):
+        line = text[start:end]
+        stripped = line.strip()
+        if not stripped:
+            continue
+        header = _HEADER_RE.fullmatch(stripped)
+        if header:
+            name = header.group(1).strip()
+            if name == "品牌概况":
+                section = "brand"
+            else:
+                section = "model"
+                if name in text:
+                    _maybe_set_model(draft, name)
+            continue
+        if section is None:
+            continue
+        matched = _KV_RE.match(stripped)
+        if not matched:
+            continue
+        key = matched.group(1).strip()
+        value = matched.group(2).strip()
+        if not value or value not in text or stripped not in text:
+            continue
+        if section == "brand":
+            _fill_brand_kv(draft, record, span_id, stripped, key, value, as_of)
+        else:
+            _fill_model_kv(draft, record, span_id, stripped, key, value, as_of)
+
+
+def _fill_brand_kv(draft, record, span_id, line, key, value, as_of) -> None:
+    if "归属" in key and "市场" in key:
+        field_key = "brand_origin_market"
+    elif "品类" in key:
+        field_key = "brand_category_focus"
+    else:
+        return
+    _append_obs(draft, field_key, _observation(
+        record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
+        status=_status_for(value), as_of=as_of,
+    ))
+
+
+def _clauses(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[；;]", value) if part.strip()]
+
+
+def _is_bluetooth_claim(clause: str) -> bool:
+    """续航分句里的「蓝牙模式」不是蓝牙能力陈述，不写入 bluetooth 字段。"""
+    if "bluetooth" in clause.lower():
+        return True
+    if "蓝牙" not in clause:
+        return False
+    if _BATTERY_RE.match(clause) and not any(
+        token in clause for token in ("支持", "不支持", "版本", "水下", "不可用")
+    ):
+        return False
+    return True
+
+
+def _fill_model_kv(draft, record, span_id, line, key, value, as_of) -> None:
+    if "降噪" in key:
+        _append_obs(draft, "noise_cancellation", _observation(
+            record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
+            status=_status_for(value), as_of=as_of,
+        ))
+    if "保修" in key:
+        _append_obs(draft, "warranty", _observation(
+            record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
+            status=_status_for(value), as_of=as_of,
+        ))
+
+    battery_modes = []
+    battery_leftover = []
+    key_is_battery = ("续航" in key) or ("电池" in key)
+    for clause in _clauses(value):
+        if clause not in (getattr(record, "original_text", "") or ""):
+            continue
+        if ("充电" in clause) or ("快充" in clause) or ("充电" in key and "续航" not in key):
+            _append_obs(draft, "charging", _observation(
+                record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+                status=_status_for(clause), as_of=as_of,
+            ))
+        if "存储" in clause or "存储" in key:
+            _append_storage(draft, record, span_id, clause, as_of)
+        if _is_bluetooth_claim(clause):
+            _append_obs(draft, "bluetooth", _observation(
+                record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+                status=_status_for(clause), as_of=as_of,
+            ))
+            if "水下" in clause:
+                _append_obs(draft, "bluetooth_underwater", _observation(
+                    record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+                    status=_status_for(clause), as_of=as_of,
+                ))
+        if any(token in clause for token in ("防水", "水深", "浸水", "淡水", "海水")) or "防水" in key:
+            _append_obs(draft, "waterproof_conditions", _observation(
+                record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+                status=_status_for(clause), as_of=as_of,
+            ))
+        ip_match = _IP_RE.search(clause)
+        if ip_match and (ip_match.group(0) in clause):
+            token = ip_match.group(0)
+            _append_obs(draft, "protection_rating", _observation(
+                record, span_id, token, fact_kind=_KIND_OFFICIAL, raw_value=token,
+                status=_STATUS_OK, as_of=as_of,
+            ))
+        weight_match = _WEIGHT_RE.search(clause)
+        if weight_match and ("重量" in key or "重量" in clause or weight_match.group(0) in clause):
+            token = weight_match.group(0)
+            amount = _number(re.search(r"\d+(?:\.\d+)?", token).group(0))
+            _append_obs(draft, "weight_g", _observation(
+                record, span_id, token, fact_kind=_KIND_OFFICIAL, raw_value=token,
+                unit="g", normalized_value=amount, status=_STATUS_OK, as_of=as_of,
+            ))
+        if key_is_battery:
+            if ("充电" in clause) or ("快充" in clause):
+                continue
+            parsed = _BATTERY_RE.match(clause)
+            if parsed and parsed.group("dur"):
+                battery_modes.append((parsed.group("mode").strip(), parsed.group("dur").strip(), clause))
+            else:
+                battery_leftover.append(clause)
+
+    for mode, duration, clause in battery_modes:
+        if duration not in clause:
+            continue
+        _append_obs(draft, "battery_by_mode", _observation(
+            record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=duration,
+            unit="小时" if "小时" in duration else None,
+            status=_status_for(clause), applicable_variant=mode or None, as_of=as_of,
+        ))
+    if key_is_battery and not battery_modes and battery_leftover:
+        leftover = "；".join(battery_leftover)
+        quote = leftover if leftover in (getattr(record, "original_text", "") or "") else value
+        raw = quote if quote != line else value
+        if raw in (getattr(record, "original_text", "") or ""):
+            _append_obs(draft, "battery_by_mode", _observation(
+                record, span_id, quote if quote in line else line,
+                fact_kind=_KIND_OFFICIAL, raw_value=raw,
+                status=_STATUS_COND, as_of=as_of,
+            ))
+
+
+def _append_storage(draft, record, span_id, clause, as_of) -> None:
+    match = _STORAGE_RE.search(clause)
+    if not match:
+        if "存储" in clause:
+            _append_obs(draft, "local_storage_gb", _observation(
+                record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+                status=_status_for(clause), as_of=as_of,
+            ))
+        return
+    amount = _number(match.group(1))
+    unit = "GB" if "GB" in clause or "gb" in clause else None
+    _append_obs(draft, "local_storage_gb", _observation(
+        record, span_id, clause, fact_kind=_KIND_OFFICIAL, raw_value=clause,
+        unit=unit, normalized_value=amount, status=_status_for(clause), as_of=as_of,
+    ))
