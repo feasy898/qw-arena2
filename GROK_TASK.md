@@ -1,15 +1,19 @@
-# 任务（第五弹）：推荐环节的确定性增强
+# 任务（第二意见评审·只读）：平台评测环境真实链失败——我的实现哪里有盲区？
 
-你在千问AI Arena参赛项目工作区。当前降级链（网关失败时）产出的 recommendation.md 是"无产品入选"的空位行——因为决策引擎消费的是全空字段。现在确定性抽取已填充 ~52% 产品字段与 ~54% 画像字段，但降级链的决策环节没有利用它们。
+背景：参赛 Agent 在"官方 Docker 本地验证工具"环境（我们逐条复刻）与本地均完整跑通真实模型链（60 秒），但平台机器评测每次运行仅 ~25 秒就完成（= 我们的降级链在跑，真实模型调用从未成功）。官方确认机测没有问题——问题一定在我们的实现。请你以独立评审视角找我们的盲区。
 
-## 任务
-1. **调研**（只读）：读 `src/pipeline.py` 的降级链如何进入决策（`_freeze_and_render` → `parse_profile/parse_products` → `constraint_matrix` → `selector`）；读 `src/constraint_engine.py` 的四态判定需要哪些字段（预算上限/价格、品类等）；读 `src/selector.py` 的入选与未选原因生成对字段的要求。
-2. **增强 `src/deterministic_extractor.py`**：确保降级链的确定性产出能驱动决策引擎给出**非空的推荐结果**：
-   - 画像的 budget_max/currency 已有；产品侧确保 current_price（展示价）有 normalized_value（数值）——决策的价格硬约束需要数值可比；
-   - 若决策仍因关键字段空而全 FAIL/UNKNOWN：在 deterministic_product_draft 中把 listing 的展示价也写入 normalized_value（当前可能只有 raw_value）；品牌/型号照旧。
-   - 目标：降级链跑示例数据时，recommendation.md 能给出真实的三款推荐（基于价格预算匹配等确凿维度），未选原因落到具体字段；不虚构任何属性。
-3. **测试**：新增子进程级测试——构造网关不可达环境（env DASHSCOPE_API_KEY=sk-invalid + OPENAI_BASE_URL=https://10.255.255.1.invalid/v1）跑 agent，断言 recommendation.md 的推荐结果表 3 行均为真实产品ID（P00x）且理由引用具体字段；pytest 全量过（当前 411）。
-4. reports/progress.md 登记。
+请阅读：
+1. `raw/competition-problemData.txt`（官方赛题原文，重点：提测标准/环境配置/模型列表/网络限制）
+2. `raw/Agent本地验证指南.md`（官方近似环境说明）
+3. `src/model_gateway.py`（我们的网关：env 解析/__init__/_probe_endpoint/_chat_real/_base_url_candidates）
+4. `src/pipeline.py` 的 run() 开头与降级分支、`agent/agent.py`
+5. `tools/official_validation/docker-compose.yml`（官方工具的 env 注入形态）
 
-## 边界
-只改 src/deterministic_extractor.py、tests/unit/test_deterministic_extractor.py（或新建 tests/unit/test_degrade_decision.py）；不改 pipeline/constraint_engine/selector/gateway；证据纪律不变。完成后输出：修改文件、测试结果、降级链 recommendation.md 的推荐三款与理由摘要。
+我的假设清单（请逐条评估可能性并指出遗漏）：
+A. OPENAI_BASE_URL 实际缺失或形态与文档不符（不以 /v1 结尾）→ 我们在 _resolve_openai_base_url 直接 raise → 网关构造失败 → 降级链（25 秒吻合）。
+B. enable_thinking 是非标参数（DashScope 特有，OpenAI 兼容格式无此参数）→ 平台网关若以 404 拒绝 → 我们的 404 处理逻辑把它当"模型不可用"→ 模型候选链耗尽 → GatewayError → 降级。
+C. 平台网关是内部地址+内部 CA → vendored certifi 验证失败（SSLError 归 ConnectionError）→ 切官方公网 → 平台 Key 对公网 401 → 全失败降级。
+D. 平台强制代理（HTTPS_PROXY）且 requests 走代理后行为差异。
+E. 其他：请你自己从文档与代码里找（重点看：我们有没有对官方文档某条要求的误读；env/路径/编码/参数的任何假设）。
+
+输出：每个假设的评估（成立可能性+理由）+ 你发现的新盲区清单（按可能性排序）+ 修复建议。只读不改任何文件。20 分钟内。
