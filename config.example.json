@@ -1,11 +1,9 @@
 {
   "version": "0.1.0",
   "comment": "复制为 config.json 后按需覆盖；所有键见 src/pipeline.resolve_config；未知键报错。密钥一律不进本文件（只从环境变量读）。",
-  "default_model": "qwen3.7-max",
+  "default_model": "qwen3.6-flash",
   "fallback_models": [
     "qwen3.6-flash",
-    "qwen3.6-plus",
-    "qwen-plus",
     "glm-5.2",
     "deepseek-v4-flash"
   ],
