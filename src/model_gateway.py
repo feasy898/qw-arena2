@@ -721,7 +721,7 @@ class ModelGateway:
                         logger.info("探测 url=%s model=%s extras=%s 网络异常 %s",
                                     url, model, extras is not None, type(exc).__name__)
                         continue
-                    if r.status_code == 200 and self._probe_content_ok(r):
+                    if r.status_code == 200:
                         self._base_url = url
                         self._probe_model = model
                         if extras is None:
