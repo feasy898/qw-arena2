@@ -1,0 +1,640 @@
+# -*- coding: utf-8 -*-
+"""src/schema_extractor.py — Schema 约束抽取 + 逐字证据锚定校验（主抽取层架构）。
+
+架构（BUILD_TASK「Schema+Grounding 抽取架构」，借开源 instructor/Outlines 思想）：
+**模型的高覆盖 + 程序的零幻觉保证**——模型输出必须过程序校验（结构 + 证据锚定），
+不通过的字段整字段丢弃（由管线用确定性抽取正则结果做字段级兜底），结构整体非法
+触发一次带错误反馈的重试；正则层（deterministic_extractor）降级为字段级兜底。
+
+契约签名（BUILD_TASK 定死，不许偏离）：
+
+- extract_profile_grounded(user_text, gateway, config) -> (profile_dict, rejected_fields)
+- extract_product_grounded(record, source_records, gateway, config) -> (draft_dict, rejected_fields)
+- _validate_with_grounding(model_output, source_text, field_schema) -> (validated, rejected)
+  纯函数、独立可测：不发模型调用、不写全局状态、不做任何模糊匹配。
+
+校验语义（rejected 为 str 列表，条目格式「字段: 原因」，供日志/评估/修复反馈）：
+1. 结构校验：键完整性/类型按 field_schema；深度归一（枚举回退、预算回填、场景
+   排序、needs 派生）**复用** src/profile_extractor 与 src/product_extractor 既有
+   实现，不在本模块重写；
+2. grounding：内容字段的 exact_quote 必须 source_text 的逐字子串（精确 ``in`` 判断；
+   任何「宽松匹配」都算违规）；
+3. 校验失败的字段从结果中剔除并记入 rejected；顶层非对象/不含任何约定键 → 结构级
+   失败（rejected 条目以 STRUCTURE_MARKER 开头），由调用方触发一次带错误反馈的重试
+   （本函数保持纯函数语义，重试编排在外层）。
+
+grounded 产品输出形态（flat，与 prompts/grounded_product.md 对齐）：
+顶层身份三字段（product_name/brand/model）+ aliases + 36 个字段键平铺，每个字段
+``{"value": ..., "exact_quote": ...}``；字段 value 为观察数组，每条观察携带自己的
+exact_quote（替代旧 evidence_refs；source_id/span_id 由代码定位回填，不采信模型）。
+
+失败重试（任务口径）：结构整体非法 → 把校验错误清单附回模型修正，最多 1 次重试；
+重试后仍结构非法 → raise GatewayError（管线走既有确定性降级链）。
+
+线上依赖仅标准库 + requests；模型 id 白名单由网关负责校验。
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from pathlib import Path
+
+from src import product_extractor, profile_extractor
+from src.input_adapter import line_spans
+from src.model_gateway import GatewayError
+
+logger = logging.getLogger("qw.schema_extractor")
+
+PROFILE_GROUNDED_PROMPT = "prompts/grounded_extraction.md"
+"""grounded 画像抽取 Prompt 模板路径（相对仓库根）。"""
+
+PRODUCT_GROUNDED_PROMPT = "prompts/grounded_product.md"
+"""grounded 产品抽取 Prompt 模板路径（相对仓库根）。"""
+
+MOCK_KEY_PROFILE = "grounded_profile_extraction"
+"""grounded 画像抽取的 mock 夹具键（interfaces.md §17 机制，键名前缀区分新旧链路）。"""
+
+STRUCTURE_MARKER = "__structure__"
+"""结构级失败在 rejected 条目中的标记前缀（区别于字段级拒绝）。"""
+
+MAX_REPAIR_ATTEMPTS = 1
+"""结构非法时带错误反馈的重试次数（任务口径：最多 1 次）。"""
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+USER_TEXT_PLACEHOLDER = "{{USER_TEXT}}"
+PRODUCT_ID_PLACEHOLDER = "{{PRODUCT_ID}}"
+ALIASES_PLACEHOLDER = "{{PRODUCT_ALIASES}}"
+SOURCES_PLACEHOLDER = "{{SOURCES_BLOCK}}"
+
+# 判定/派生类字段：取值为程序口径的枚举/编号，无原文逐字形态，不强制 quote
+_PROFILE_UNGROUNDED_SCALARS = frozenset({"profile_id", "currency", "budget_semantics"})
+_SCENE_UNGROUNDED_CHILDREN = frozenset({"scene_priority", "priority_basis"})
+_NEED_UNGROUNDED_CHILDREN = frozenset(
+    {"original_expression", "need_type", "operator", "expected_value", "priority"})
+
+PRODUCT_IDENTITY_KEYS = ("product_name", "brand", "model")
+"""grounded 产品输出的顶层身份标量字段（canonical_id/aliases 由代码确定性填充）。"""
+
+PROFILE_REPAIR_INSTRUCTION = (
+    "上一次输出未通过结构校验：{detail}。请重新输出完整 JSON：只输出一个合法 JSON 对象，"
+    "每个字段必须是 {{\"value\": 取值, \"exact_quote\": 逐字证据}} 形态，"
+    "exact_quote 必须是用户描述原文的逐字连续片段，不确定的字段 value 填 null，"
+    "不要 Markdown 代码围栏，不要解释文字。"
+)
+
+PRODUCT_REPAIR_INSTRUCTION = (
+    "上一次输出未通过结构校验：{detail}。请重新输出完整 JSON：只输出一个合法 JSON 对象，"
+    "顶层平铺 product_name/brand/model/aliases 与全部 36 个字段键，每个字段必须是 "
+    "{{\"value\": 取值, \"exact_quote\": 逐字证据}} 形态，每条观察自带 exact_quote 且必须是"
+    "所给五源资料某一行 [L行号] 之后原文内容的逐字连续片段（不含前缀与来源标题行），"
+    "无信息的字段给 {{\"value\": [], \"exact_quote\": null}}，"
+    "不要 Markdown 代码围栏，不要解释文字。"
+)
+
+LAST_GROUNDING_MANIFEST: dict = {}
+"""评估观测点：最近一次 grounded 抽取的逐字证据清单（进程内供 tools/local_eval.py 读取）。
+
+结构：{"profile": {字段: {"value":…, "exact_quote":…}}, "products": {P编号: {字段: [quote,…]}}}。
+仅评估工具进程内读取，不落盘、不参与线上链路；extract_* 每次调用覆盖写入。
+"""
+
+
+# ---------------------------------------------------------------------------
+# 字段 Schema（驱动 _validate_with_grounding 的唯一依据）
+# ---------------------------------------------------------------------------
+
+def profile_field_schema() -> dict:
+    """画像 grounded 输出的字段 Schema（与 profile_extractor 的键集保持同源）。"""
+    fields: dict = {}
+    for key in profile_extractor.SCALARS:
+        fields[key] = {"type": "scalar",
+                       "grounded": key not in _PROFILE_UNGROUNDED_SCALARS}
+    for key in profile_extractor.LISTS:
+        fields[key] = {"type": "list", "grounded": True}
+    fields[profile_extractor.LIST_KEY] = {
+        "type": "structured_list", "grounded": False,
+        "children": {
+            "scene_name": {"type": "scalar", "grounded": True},
+            "usage_duration": {"type": "scalar", "grounded": True},
+            "usage_frequency": {"type": "scalar", "grounded": True},
+            "scene_priority": {"type": "scalar", "grounded": False},
+            "priority_basis": {"type": "scalar", "grounded": False},
+            "scene_evidence": {"type": "scalar", "grounded": True},
+        },
+    }
+    fields[profile_extractor.NEEDS_KEY] = {
+        "type": "structured_list", "grounded": False,
+        "children": {
+            **{key: {"type": "scalar", "grounded": key not in _NEED_UNGROUNDED_CHILDREN}
+               for key in ("original_expression", "need_type", "operator",
+                           "expected_value", "priority")},
+            "evidence_quote": {"type": "scalar", "grounded": True},
+        },
+    }
+    return {"fields": fields}
+
+
+def product_field_schema() -> dict:
+    """产品 grounded 输出的字段 Schema（36 个观察字段键与 product_extractor 同源）。"""
+    fields: dict = {key: {"type": "scalar", "grounded": True}
+                    for key in PRODUCT_IDENTITY_KEYS}
+    fields["aliases"] = {"type": "list", "grounded": False}
+    for key in product_extractor._field_keys():
+        # 身份五键（canonical_id/aliases/product_name/brand/model）不是观察数组：
+        # 前两者由代码确定性填充，后三者在顶层按标量登记，禁止被观察规格覆盖
+        if key in ("aliases", "canonical_id") or key in PRODUCT_IDENTITY_KEYS:
+            continue
+        fields[key] = {"type": "observation_list", "grounded": False}
+        # 观察级 exact_quote 恒为证据锚点（见 _validate_field 的 observation_list 分支）
+    return {"fields": fields}
+
+
+# ---------------------------------------------------------------------------
+# 核心校验（纯函数）
+# ---------------------------------------------------------------------------
+
+def _validate_with_grounding(model_output: dict, source_text: str,
+                             field_schema: dict) -> tuple[dict, list[str]]:
+    """核心校验（纯函数，独立可测）：结构 + 逐字证据锚定。
+
+    :param model_output: 模型原始输出（每字段 {"value":…, "exact_quote":…} 形态）
+    :param source_text: 逐字锚定基准文本（画像=用户描述原文；产品=五源原文拼接）
+    :param field_schema: profile_field_schema()/product_field_schema() 产出
+    :return: (通过校验的裸值字段 dict, rejected 条目列表)；被拒/缺失字段不出现在
+        结果中（由管线用确定性正则结果做字段级兜底）；结构级失败条目以
+        STRUCTURE_MARKER 开头
+    """
+    fields = (field_schema or {}).get("fields") or {}
+    if not isinstance(model_output, dict):
+        return {}, [f"{STRUCTURE_MARKER}: 顶层必须是 JSON 对象"]
+    if not set(fields).intersection(model_output.keys()):
+        return {}, [f"{STRUCTURE_MARKER}: 输出不含任何约定字段键"]
+    rejected: list[str] = []
+    result: dict = {}
+    for key, spec in fields.items():
+        entry = model_output.get(key)
+        if entry is None:
+            continue  # 未抽取（模型 null/缺省）→ 字段缺失，不记 rejected
+        value, problems = _validate_field(key, entry, spec or {}, source_text)
+        rejected.extend(problems)
+        if value is None:
+            continue  # 字段级失败：整字段剔除（兜底路径接管）；条目级失败保留余下内容
+        result[key] = value
+    return result, rejected
+
+
+def _is_structure_failure(rejected: list[str]) -> bool:
+    """rejected 中是否存在结构级失败条目（调用方据此触发修复重试）。"""
+    return any(str(entry).startswith(STRUCTURE_MARKER) for entry in rejected or [])
+
+
+def _validate_field(key: str, entry, spec: dict,
+                    source_text: str) -> tuple[object, list[str]]:
+    """单字段校验：包装形态 → 类型 → grounding。失败返回 (None, problems)。
+
+    包装容差（实测校准，2026-09-29 真实链）：flash 模型对部分字段会返回裸值形态
+    （无 {"value", "exact_quote"} 包装）。仅当字段级不强制 quote 时（grounded=False
+    或结构化/观察列表——证据锚点在子字段/观察级）接受裸值；grounded=True 的
+    标量/列表仍严格要求包装（其 quote 就是证据锚点，缺失即整字段拒绝）。
+    """
+    ftype = spec.get("type") or "scalar"
+    if not isinstance(entry, dict) or ("value" not in entry and "exact_quote" not in entry):
+        if not spec.get("grounded") or ftype in ("structured_list", "observation_list"):
+            entry = {"value": entry, "exact_quote": None}  # 裸值容差（无字段级锚点要求）
+        else:
+            return None, [f"{key}: 字段必须是 {{value, exact_quote}} 对象"]
+    value = entry.get("value")
+    quote = entry.get("exact_quote")
+    if value is None or value == [] or (isinstance(value, str) and not value.strip()):
+        return None, []  # 显式缺失 → 字段不出现在结果（兜底路径接管）
+
+    if ftype == "scalar":
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            return None, [f"{key}: value 类型必须是 字符串/数字/null"]
+        return _grounded_value(value, quote, key, spec, source_text)
+
+    if ftype == "list":
+        if not isinstance(value, list):
+            return None, [f"{key}: value 必须是数组"]
+        items = [str(item).strip() for item in value if str(item).strip()]
+        if not items:
+            return None, []
+        return _grounded_value(items, quote, key, spec, source_text)
+
+    if ftype == "structured_list":
+        if not isinstance(value, list):
+            return None, [f"{key}: value 必须是数组"]
+        children = spec.get("children") or {}
+        kept: list[dict] = []
+        problems: list[str] = []
+        for index, item in enumerate(value, 1):
+            clean, item_problems = _validate_structured_item(
+                key, index, item, children, source_text)
+            kept.append(clean)
+            problems.extend(item_problems)
+        kept = [item for item in kept if item]
+        if not kept:
+            return None, problems
+        return kept, problems
+
+    if ftype == "observation_list":
+        if not isinstance(value, list):
+            return None, [f"{key}: value 必须是观察数组"]
+        kept_obs: list[dict] = []
+        problems = []
+        for index, obs in enumerate(value, 1):
+            if not isinstance(obs, dict):
+                problems.append(f"{key}[{index}]: 观察必须是对象")
+                continue
+            obs_quote = obs.get("exact_quote")
+            if not isinstance(obs_quote, str) or not obs_quote.strip():
+                problems.append(f"{key}[{index}]: 观察缺 exact_quote（禁止无证据取值）")
+                continue
+            if obs_quote not in source_text:  # 精确子串判断，不做模糊匹配
+                problems.append(
+                    f"{key}[{index}]: 观察的 exact_quote 非原文逐字子串: {obs_quote[:30]!r}")
+                continue
+            kept_obs.append(obs)
+        if not kept_obs:
+            return None, problems
+        return kept_obs, problems
+
+    return None, [f"{key}: 未知字段类型 {ftype!r}"]
+
+
+def _grounded_value(value, quote, key: str, spec: dict,
+                    source_text: str) -> tuple[object, list[str]]:
+    """标量/列表取值的 grounding 判定（grounded=False 的字段不强制 quote）。"""
+    if not spec.get("grounded"):
+        return value, []
+    if not isinstance(quote, str) or not quote.strip():
+        return None, [f"{key}: exact_quote 缺失（禁止无证据取值）"]
+    if quote not in source_text:  # 精确子串判断，不做模糊匹配
+        return None, [f"{key}: exact_quote 非原文逐字子串: {quote[:30]!r}"]
+    return value, []
+
+
+def _validate_structured_item(key: str, index: int, item, children: dict,
+                              source_text: str) -> tuple[dict, list[str]]:
+    """structured_list 单条目校验：子字段逐个解包 {value, exact_quote}。"""
+    problems: list[str] = []
+    if not isinstance(item, dict):
+        return {}, [f"{key}[{index}]: 条目必须是对象"]
+    clean: dict = {}
+    for child_key, child_spec in children.items():
+        child_entry = item.get(child_key)
+        if child_entry is None:
+            continue
+        if not isinstance(child_entry, dict) or (
+                "value" not in child_entry and "exact_quote" not in child_entry):
+            if not (child_spec or {}).get("grounded"):
+                child_entry = {"value": child_entry, "exact_quote": None}  # 裸值容差
+            else:
+                problems.append(
+                    f"{key}[{index}].{child_key}: 必须是 {{value, exact_quote}} 对象")
+                continue
+        child_value = child_entry.get("value")
+        if child_value is None or (isinstance(child_value, str) and not child_value.strip()):
+            continue
+        if isinstance(child_value, bool) or not isinstance(child_value, (str, int, float)):
+            problems.append(f"{key}[{index}].{child_key}: value 类型必须是 字符串/数字/null")
+            continue
+        child_value = str(child_value).strip() if isinstance(child_value, str) else child_value
+        value, child_problems = _grounded_value(
+            child_value, child_entry.get("exact_quote"),
+            f"{key}[{index}].{child_key}", child_spec or {}, source_text)
+        problems.extend(child_problems)
+        if value is not None:
+            clean[child_key] = value
+    return clean, problems
+
+
+# ---------------------------------------------------------------------------
+# 画像 grounded 抽取
+# ---------------------------------------------------------------------------
+
+def extract_profile_grounded(user_text: str, gateway, config) -> tuple[dict, list[str]]:
+    """画像抽取（模型+校验）。契约签名。
+
+    流程：渲染 grounded 提示词 → gateway.chat_json → _validate_with_grounding
+    （结构+逐字锚定）→ 结构整体非法时带错误反馈重试一次 → 仍非法 raise GatewayError
+    → 通过校验的裸值字段交给 profile_extractor._normalize_profile 做深度归一
+    （枚举回退/预算回填/场景排序/needs 派生，复用既有校验逻辑）。
+
+    :return: (画像对象 dict, rejected_fields)；rejected_fields 记录被丢弃的字段与原因
+    :raises src.model_gateway.GatewayError: 模型输出经一次修复重试仍结构非法
+    """
+    text = user_text or ""
+    started = time.monotonic()
+    model = str(config.get("default_model") or "qwen3.6-plus")
+    schema = profile_field_schema()
+    messages = [
+        {"role": "system", "content": "你是严格按约定输出 JSON 的信息抽取器。"},
+        {"role": "user", "content": render_grounded_profile_prompt(text)},
+    ]
+    attempts = 1 + max(0, MAX_REPAIR_ATTEMPTS)
+    validated: dict = {}
+    rejected: list[str] = []
+    last_parsed: dict = {}
+    structure_failed = True
+    for attempt in range(1, attempts + 1):
+        parsed = gateway.chat_json(messages, model, mock_key=MOCK_KEY_PROFILE)
+        last_parsed = parsed if isinstance(parsed, dict) else {}
+        validated, rejected = _validate_with_grounding(parsed, text, schema)
+        structure_failed = _is_structure_failure(rejected)
+        if not structure_failed:
+            break
+        logger.warning("画像 grounded 输出结构非法 attempt=%d problems=%s",
+                       attempt, "；".join(rejected[:5]))
+        if attempt < attempts:
+            messages = list(messages) + [
+                {"role": "assistant", "content": json.dumps(last_parsed, ensure_ascii=False)},
+                {"role": "user",
+                 "content": PROFILE_REPAIR_INSTRUCTION.format(detail="；".join(rejected[:8]))},
+            ]
+    if structure_failed:
+        raise GatewayError(
+            f"画像 grounded 抽取经一次修复重试仍结构非法：{'；'.join(rejected[:5])}")
+
+    profile, _needs, problems = profile_extractor._normalize_profile(validated, text)
+    # 归一层此时仅可能报 needs 条目级问题（形状问题已在 grounding 校验剔除）：
+    # 单条需求不拖垮整份画像，记入 rejected 供日志/评估，不触发整体重试
+    rejected = list(rejected) + [f"needs: {p}" for p in problems]
+    LAST_GROUNDING_MANIFEST["profile"] = _profile_manifest(last_parsed, validated)
+    logger.info("画像 grounded 抽取成功 字段=%d 拒绝=%d 耗时=%.2fs",
+                len(validated), len(rejected), time.monotonic() - started)
+    return profile, rejected
+
+
+def render_grounded_profile_prompt(user_text: str) -> str:
+    """读取 grounded 画像 Prompt 模板并替换 {{USER_TEXT}}（模板缺失/非法 raise GatewayError）。"""
+    return _render_template(REPO_ROOT / PROFILE_GROUNDED_PROMPT,
+                            USER_TEXT_PLACEHOLDER, user_text or "",
+                            "grounded 画像抽取")
+
+
+# ---------------------------------------------------------------------------
+# 产品 grounded 抽取
+# ---------------------------------------------------------------------------
+
+def extract_product_grounded(record, source_records, gateway,
+                             config) -> tuple[dict, list[str]]:
+    """单产品抽取（模型+校验）。契约签名。
+
+    流程：五源记录渲染 grounded 提示词 → gateway.chat_json → _validate_with_grounding
+    （字段形态+观察级逐字锚定）→ 结构整体非法时带错误反馈重试一次 → 观察的
+    exact_quote 由代码定位回 source_id/span_id（不采信模型自报）→ 复用
+    product_extractor 既有观察归一/身份校验逻辑产出草稿（键集与旧草稿一致，
+    可直接进入 reconciler）。
+
+    :return: (产品对象草稿 dict, rejected_fields)
+    :raises src.model_gateway.GatewayError: 模型输出经一次修复重试仍结构非法
+    """
+    canonical_id = record.canonical_id
+    records = _ordered_records(source_records or [])
+    if not records:
+        logger.warning("产品 %s 无任何来源记录，跳过模型调用（空草稿）", canonical_id)
+        return product_extractor.empty_draft(record), []
+    started = time.monotonic()
+    model = str(config.get("default_model") or "qwen3.6-plus")
+    schema = product_field_schema()
+    # grounding 基准 = 五源原文按确定性顺序拼接（不含 [L行号] 前缀与来源标题行）
+    source_text = "\n".join(str(r.original_text) for r in records)
+    messages = [
+        {"role": "system", "content": "你是严格按约定输出 JSON 的信息抽取器。"},
+        {"role": "user", "content": render_grounded_product_prompt(
+            canonical_id, list(record.original_ids), records)},
+    ]
+    attempts = 1 + max(0, MAX_REPAIR_ATTEMPTS)
+    validated: dict = {}
+    rejected: list[str] = []
+    last_parsed: dict = {}
+    structure_failed = True
+    for attempt in range(1, attempts + 1):
+        parsed = gateway.chat_json(messages, model, mock_key=_mock_key(canonical_id))
+        last_parsed = parsed if isinstance(parsed, dict) else {}
+        validated, rejected = _validate_with_grounding(parsed, source_text, schema)
+        structure_failed = _is_structure_failure(rejected)
+        if not structure_failed:
+            break
+        logger.warning("产品 %s grounded 输出结构非法 attempt=%d problems=%s",
+                       canonical_id, attempt, "；".join(rejected[:5]))
+        if attempt < attempts:
+            messages = list(messages) + [
+                {"role": "assistant", "content": json.dumps(last_parsed, ensure_ascii=False)},
+                {"role": "user",
+                 "content": PRODUCT_REPAIR_INSTRUCTION.format(detail="；".join(rejected[:8]))},
+            ]
+    if structure_failed:
+        raise GatewayError(
+            f"产品 {canonical_id} grounded 抽取经一次修复重试仍结构非法："
+            f"{'；'.join(rejected[:5])}")
+
+    draft, draft_rejected = _grounded_to_draft(validated, record, records)
+    rejected = list(rejected) + draft_rejected
+    LAST_GROUNDING_MANIFEST.setdefault("products", {})[canonical_id] = (
+        _product_manifest(last_parsed, validated))
+    logger.info("产品 %s grounded 抽取成功 字段=%d 拒绝=%d 耗时=%.2fs",
+                canonical_id, len(validated), len(rejected), time.monotonic() - started)
+    return draft, rejected
+
+
+def render_grounded_product_prompt(canonical_id: str, aliases: list, records: list) -> str:
+    """读取 grounded 产品 Prompt 模板并替换三个占位符（模板缺失/非法 raise GatewayError）。"""
+    path = REPO_ROOT / PRODUCT_GROUNDED_PROMPT
+    try:
+        template = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise GatewayError(f"grounded 产品抽取 Prompt 模板缺失: {path}（{exc}）") from exc
+    for placeholder in (PRODUCT_ID_PLACEHOLDER, ALIASES_PLACEHOLDER, SOURCES_PLACEHOLDER):
+        if placeholder not in template:
+            raise GatewayError(
+                f"grounded 产品抽取 Prompt 模板缺少占位符 {placeholder}: {path}")
+    block = product_extractor.render_sources_block(records)
+    return (template
+            .replace(PRODUCT_ID_PLACEHOLDER, canonical_id)
+            .replace(ALIASES_PLACEHOLDER, json.dumps(list(aliases), ensure_ascii=False))
+            .replace(SOURCES_PLACEHOLDER, block))
+
+
+def _mock_key(canonical_id: str) -> str:
+    """grounded 产品抽取的 mock 夹具键：grounded_product_{canonical_id}。"""
+    return f"grounded_product_{canonical_id}"
+
+
+def _ordered_records(records: list) -> list:
+    """五源记录确定性排序（与 product_extractor.render_sources_block 同口径）。"""
+    return sorted(records, key=lambda r: (str(getattr(r, "source_type", "")),
+                                          str(getattr(r, "source_id", ""))))
+
+
+# ---------------------------------------------------------------------------
+# grounded 输出 → 旧草稿形态（reconciler 消费；复用既有归一/身份校验）
+# ---------------------------------------------------------------------------
+
+def _grounded_to_draft(validated: dict, record, records: list) -> tuple[dict, list[str]]:
+    """通过校验的裸值字段 → 产品对象草稿（键集与 product_extractor.empty_draft 一致）。"""
+    draft = product_extractor._base_draft(record)
+    rejected: list[str] = []
+    records_by_id = {r.source_id: r for r in records}
+
+    # 身份字段：grounded 严格口径——模型值必须逐字出现在五源原文中才采信
+    # （field_catalog verbatim_rule「原样沿用」；quote 锚定不住值本身，实测发现
+    # flash 会输出「RalunPro」这类丢空格变体）；否则回落 registry 登记原样值
+    source_text = "\n".join(str(r.original_text) for r in records)
+
+    def _verbatim_identity(value, registered):
+        value = product_extractor._clean_text(value)
+        if value and value in source_text:
+            return value
+        if value:
+            logger.info("产品 %s 身份字段 %r 非原文逐字（quote 锚定不住值），回落登记值 %r",
+                        record.canonical_id, value, registered)
+        return registered
+
+    draft["product_name"] = _verbatim_identity(validated.get("product_name"),
+                                               record.model_raw)
+    draft["brand"] = _verbatim_identity(validated.get("brand"), record.brand_raw)
+    draft["model"] = _verbatim_identity(validated.get("model"), record.model_raw)
+    # aliases：registry 权威并集模型提示的编号写法（不采信改写，与旧链路同口径）
+    model_aliases = [str(a).strip() for a in (validated.get("aliases") or [])
+                     if str(a).strip()]
+    draft["aliases"] = sorted({*record.original_ids, *model_aliases})
+
+    known = set(product_extractor._field_keys())
+    for field_key in known:
+        if field_key in ("aliases", "canonical_id") or field_key in PRODUCT_IDENTITY_KEYS:
+            # aliases/canonical_id 已落位；身份三键（product_name/brand/model）是顶层
+            # 标量（上面已按身份兼容规则落位），都不是观察数组，禁止进入观察循环
+            continue
+        observations = validated.get(field_key) or []
+        is_list_field = bool(field_key in product_extractor.LIST_FIELDS)
+        normalized: list[dict] = []
+        for index, obs in enumerate(observations, 1):
+            obs_with_evidence = dict(obs)
+            obs_with_evidence["evidence_refs"] = _locate_evidence_refs(
+                records, str(obs.get("exact_quote") or ""))
+            clean, problems = product_extractor._normalize_observation(
+                field_key, index, obs_with_evidence, records_by_id, is_list_field)
+            if problems:
+                # 观察级枚举/结构问题：整条丢弃并记 rejected（字段级兜底接管），不整体重试
+                rejected.extend(f"{field_key}[{index}]: {p}" for p in problems)
+                continue
+            normalized.extend(clean)
+        draft[field_key] = normalized
+    return draft, rejected
+
+
+def _locate_evidence_refs(records: list, quote: str) -> list[dict]:
+    """把已通过逐字锚定的 quote 定位回 (source_id, span_id)（代码定位，不采信模型）。
+
+    定位失败（跨来源拼接命中等罕见情形）返回空列表：观察仍保留（值本身已通过
+    逐字锚定），仅无 span 级出处。
+    """
+    if not quote:
+        return []
+    for record in records:
+        text = str(record.original_text)
+        position = text.find(quote)
+        if position < 0:
+            continue
+        spans = record.spans or line_spans(text)
+        for span_id, start, end in spans:
+            if start <= position < end or (start == end == position):
+                return [{"source_id": record.source_id, "span_id": span_id,
+                         "exact_quote": quote}]
+        return [{"source_id": record.source_id, "span_id": "L1", "exact_quote": quote}]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# 评估观测点（LAST_GROUNDING_MANIFEST 的构造；不参与校验语义）
+# ---------------------------------------------------------------------------
+
+def _profile_manifest(parsed: dict, validated: dict) -> dict:
+    """从模型原始输出提取通过校验字段的 (value, exact_quote) 清单。"""
+    manifest: dict = {}
+    for key in validated:
+        entry = parsed.get(key)
+        if isinstance(entry, dict):
+            manifest[key] = {"value": validated[key],
+                             "exact_quote": entry.get("exact_quote")}
+    return manifest
+
+
+def _product_manifest(parsed: dict, validated: dict) -> dict:
+    """从模型原始输出提取通过校验字段的观察级 quote 清单。"""
+    manifest: dict = {}
+    for key, value in validated.items():
+        entry = parsed.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(value, list) and value and isinstance(value[0], dict) \
+                and "exact_quote" in (value[0] or {}):
+            manifest[key] = [str(obs.get("exact_quote") or "") for obs in value]
+        else:
+            manifest[key] = {"value": value, "exact_quote": entry.get("exact_quote")}
+    return manifest
+
+
+def _render_template(path: Path, placeholder: str, payload: str, label: str) -> str:
+    """读模板并替换单一占位符（模板缺失/非法 raise GatewayError；与既有抽取器同口径）。"""
+    try:
+        template = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise GatewayError(f"{label} Prompt 模板缺失: {path}（{exc}）") from exc
+    if placeholder not in template:
+        raise GatewayError(f"{label} Prompt 模板缺少占位符 {placeholder}: {path}")
+    return template.replace(placeholder, payload)
+
+
+# ---------------------------------------------------------------------------
+# 字段级融合（模型通过校验的字段优先；缺失/被拒字段由确定性正则结果兜底）
+# ---------------------------------------------------------------------------
+
+def fuse_profile_fields(model_profile: dict, fallback_profile: dict) -> dict:
+    """画像字段级融合：模型值优先，None/空 → deterministic_profile 结果兜底。
+
+    口径（BUILD_TASK）：字段级判定——模型非空即整字段采信（不做条目级混拼），
+    缺失/被拒字段整字段回落正则结果；仍无 → 渲染层既有空值路径。
+    """
+    model = model_profile or {}
+    fallback = fallback_profile or {}
+    merged: dict = {}
+    for key in profile_extractor.SCALARS:
+        value = model.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            value = fallback.get(key)
+        merged[key] = value
+    for key in profile_extractor.LISTS:
+        value = model.get(key) or []
+        merged[key] = list(value) if value else list(fallback.get(key) or [])
+    scenes = model.get("scenes") or []
+    merged["scenes"] = list(scenes) if scenes else list(fallback.get("scenes") or [])
+    return merged
+
+
+def fuse_product_drafts(model_draft: dict, fallback_draft: dict) -> dict:
+    """产品草稿字段级融合：模型观察列表优先，空列表 → deterministic 正则草稿兜底。
+
+    身份标量（product_name/brand/model）模型值优先、None 回落；aliases 并集
+    （两侧均为 registry 权威并集，重集合并无害）；canonical_id 两侧一致。
+    """
+    model = model_draft or {}
+    fallback = fallback_draft or {}
+    merged: dict = {}
+    merged["canonical_id"] = model.get("canonical_id") or fallback.get("canonical_id")
+    for key in PRODUCT_IDENTITY_KEYS:
+        value = model.get(key)
+        merged[key] = value if value else fallback.get(key)
+    merged["aliases"] = sorted({str(a).strip() for a in (model.get("aliases") or [])
+                                if str(a).strip()}
+                               | {str(a).strip() for a in (fallback.get("aliases") or [])
+                                  if str(a).strip()})
+    for field_key in product_extractor._field_keys():
+        if field_key in ("aliases", "canonical_id") or field_key in PRODUCT_IDENTITY_KEYS:
+            continue  # 身份标量/别名/编号已在上方落位，不是观察数组
+        model_obs = model.get(field_key) or []
+        merged[field_key] = model_obs if model_obs else list(fallback.get(field_key) or [])
+    return merged
