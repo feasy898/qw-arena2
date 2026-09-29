@@ -56,10 +56,15 @@ from src.deterministic_extractor import (
     deterministic_product_draft,
     deterministic_profile,
 )
-from src.product_extractor import empty_draft, extract_products
 from src.product_registry import build_registry
-from src.profile_extractor import extract_profile_bundle
+from src.profile_extractor import profile_id_from_filename
 from src.reconciler import find_coverage_gaps, reconcile_product
+from src.schema_extractor import (
+    extract_product_grounded,
+    extract_profile_grounded,
+    fuse_product_drafts,
+    fuse_profile_fields,
+)
 from src.renderer import parse_products, parse_profile, render_products, render_profile
 from src.report_writer import (
     build_output_bundle,
@@ -389,6 +394,29 @@ def _partition_coverage_gaps(finals: dict, registry) -> tuple[list[dict], list[d
     return required, optional
 
 
+def _nonempty_field_count(final: dict) -> int:
+    """产品归并终稿的「通过校验（非空）字段数」（修复环采纳判据：只升不降）。
+
+    口径：身份标量非 None 计 1；观察列表/续航条目/别名列表非空计 1；
+    归并后的 FactCell dict 以 raw_value/conditions/items 任一非空计 1
+    （待核验型观察带条件说明，亦属有内容的表达）。
+    """
+    count = 0
+    for key, value in (final or {}).items():
+        if key == "canonical_id":
+            continue
+        if isinstance(value, dict):
+            if (value.get("raw_value") is not None or value.get("conditions")
+                    or value.get("items")):
+                count += 1
+        elif isinstance(value, list):
+            if value:
+                count += 1
+        elif value is not None:
+            count += 1
+    return count
+
+
 def run(input_dir: PathLike, output_dir: PathLike, config: dict) -> OutputBundle:
     """一次调用完成端到端主链（不请求补充信息、不访问外部商品信息）。
 
@@ -464,29 +492,40 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
     for warning in bundle_in.warnings:
         logger.warning("输入侧提示：%s", warning)
 
-    # ---- 2. 画像抽取（模型；降级→确定性空画像，未知如实保留） ----------------
+    # ---- 2. 画像抽取（grounded 模型抽取 + 字段级融合；降级→确定性，未知如实保留） --
+    # v0.5.0（Schema+Grounding 架构）：模型可用时主路径走 schema_extractor——模型输出
+    # 必须过程序校验（结构 + exact_quote 逐字锚定），被拒/缺失字段用确定性正则结果
+    # 做字段级兜底融合；模型路径整体失败 → 既有确定性降级链不变。
     stage_started = time.monotonic()
     degrade_template = (gateway is None
                         or budget.degradation_stage() == "template_only")
+    profile: dict
+    fallback_profile: dict
     if degrade_template:
         # v0.4.5（平台评测联调）：降级路径改用确定性抽取器（grok 实现）——从原文
         # 保守提取确凿字段（预算数字/设备/场景/货架列/官网键值行），远好于全空表
-        profile: dict = deterministic_profile(
+        profile = deterministic_profile(
             user_text, user_description_file=user_description_name)
         logger.warning("模型路径不可用或已达 template_only 降级：画像走确定性抽取"
                        "（确凿字段填充，未知如实保留）")
     else:
+        fallback_profile = deterministic_profile(
+            user_text, user_description_file=user_description_name)
         try:
+            grounded, profile_rejected = extract_profile_grounded(
+                user_text, gateway, config)
+            if profile_rejected:
+                logger.warning("画像 grounded 校验拒绝 %d 项（字段级兜底接管）：%s",
+                               len(profile_rejected), profile_rejected[:8])
             # 画像编号按官方 value_rule 取输入文件名编号（User_Description_n）：
-            # 把用户描述文件名传给抽取器，由代码层在模型输出校验后注入 profile_id
-            # （文件名只用于解析编号，不进入提示词正文——防提示注入纪律）
-            profile, _model_needs = extract_profile_bundle(
-                user_text, gateway, config,
-                user_description_file=user_description_name)
+            # 文件名只用于解析编号，不进入提示词正文（防提示注入纪律）
+            injected_id = profile_id_from_filename(user_description_name)
+            if injected_id is not None:
+                grounded["profile_id"] = injected_id
+            profile = fuse_profile_fields(grounded, fallback_profile)
         except TokenBudgetExceeded:
             degrade_template = True
-            profile = deterministic_profile(
-                user_text, user_description_file=user_description_name)
+            profile = fallback_profile
             logger.warning("token 预算超限：画像降级为确定性抽取（未知如实保留），"
                            "后续模型调用停用（禁止丢产品）")
         except (GatewayError, UpstreamFatalError) as exc:
@@ -494,37 +533,46 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
             # 且候选链耗尽/鉴权失败）→ 画像与产品全部走确定性空草稿，仍产出结构
             # 完整的三份文档退出 0，评测按结构维度给分而非记 0 分。
             degrade_template = True
-            profile = deterministic_profile(
-                user_text, user_description_file=user_description_name)
+            profile = fallback_profile
             logger.error("画像抽取模型失败（%s: %s）：画像降级为确定性抽取"
                          "（确凿字段填充，未知如实保留）", type(exc).__name__, exc)
     log_stage(logger, "extract_profile", stage_started)
 
-    # ---- 3. 五源产品事实抽取 → 归并/冲突（逐产品；可降级，不丢产品） ---------
+    # ---- 3. 五源产品事实抽取 → 归并/冲突（逐产品 grounded+融合；可降级，不丢产品） --
     stage_started = time.monotonic()
     drafts: dict[str, dict] = {}
+    products_rejected: dict[str, list[str]] = {}
     for record in registry.all():
         cid = record.canonical_id
+        records_for = source_index.by_product(cid)
         if degrade_template or budget.degradation_stage() == "template_only":
-            drafts[cid] = deterministic_product_draft(record, source_index.by_product(cid))
+            drafts[cid] = deterministic_product_draft(record, records_for)
             logger.warning("产品 %s 抽取降级为确定性抽取（确凿字段填充）", cid)
             continue
+        fallback_draft = deterministic_product_draft(record, records_for)
         try:
-            drafts.update(extract_products([record], source_index, gateway, config))
-        except TokenBudgetExceeded:
-            degrade_template = True
-            drafts[cid] = deterministic_product_draft(record, source_index.by_product(cid))
-            logger.warning("token 预算超限：产品 %s 起降级为确定性抽取", cid)
+            grounded_draft, rejected = extract_product_grounded(
+                record, records_for, gateway, config)
+            if rejected:
+                products_rejected[cid] = list(rejected)
+                logger.warning("产品 %s grounded 校验拒绝 %d 项（字段级兜底接管）：%s",
+                               cid, len(rejected), rejected[:6])
+            # 字段级融合：模型通过校验的字段优先；缺失/被拒字段用正则结果兜底填充
+            drafts[cid] = fuse_product_drafts(grounded_draft, fallback_draft)
         except MockResponseMissingError:
             # mock 夹具缺键：禁止静默兜底（契约 §5）；该产品按缺口如实落表并继续全链
-            drafts[cid] = deterministic_product_draft(record, source_index.by_product(cid))
-            logger.error("mock 夹具缺产品 %s 的应答键：该产品走确定性抽取", cid)
+            drafts[cid] = fallback_draft
+            logger.error("mock 夹具缺产品 %s 的 grounded 应答键：该产品走确定性抽取", cid)
+        except TokenBudgetExceeded:
+            degrade_template = True
+            drafts[cid] = fallback_draft
+            logger.warning("token 预算超限：产品 %s 起降级为确定性抽取", cid)
         except (GatewayError, UpstreamFatalError) as exc:
             # v0.3.0（评测联调）：单产品的模型失败（限流重试用尽/超时/参数被拒/
             # 候选链耗尽）不再拖垮整链——该产品降级为确定性空草稿（字段以缺失
             # 表达落表），后续产品停用模型调用，保证三份文档完整产出退出 0。
             degrade_template = True
-            drafts[cid] = deterministic_product_draft(record, source_index.by_product(cid))
+            drafts[cid] = fallback_draft
             logger.error("产品 %s 抽取模型失败（%s: %s）：该产品降级为确定性抽取，"
                          "后续产品停用模型调用（禁止丢产品）",
                          cid, type(exc).__name__, exc)
@@ -577,26 +625,46 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
                            budget.degradation_stage())
             break
 
-        # 修复动作：缺口登记 → 上游重查 → 更新归并终稿（下一轮重新冻结/决策）
-        # 只重查「必须字段缺口」产品（审计修复：非必填缺口仅登记日志不触发重查，
-        # 无必须缺口时不盲目重查全部产品——重查无法补齐资料确无的字段，徒耗 token）
-        targets = sorted({gap["canonical_id"] for gap in gaps if gap.get("canonical_id")})
+        # 修复动作：缺口登记 → 上游定点重查 → 更新归并终稿（下一轮重新冻结/决策）。
+        # v0.5.0（Schema+Grounding 架构）：重查目标 = 必须字段缺口产品 ∪ grounded
+        # 校验发生字段拒绝的产品（对 rejected 字段定点重查，目标=通过校验的字段数
+        # 提升：重查结果按非空字段数比较，未提升则保留原结果，不做无谓回退）。
+        # 非必填缺口仅登记日志不触发重查（重查无法补齐资料确无的字段，徒耗 token）。
+        targets = sorted({gap["canonical_id"] for gap in gaps if gap.get("canonical_id")}
+                         | set(products_rejected))
         if not targets:
-            logger.warning("修复循环 %d/%d：无必须字段缺口可定点重查，跳过重查（保留当前产出）",
-                           round_index + 1, repair_loops)
+            logger.warning("修复循环 %d/%d：无必须字段缺口/rejected 字段可定点重查，"
+                           "跳过重查（保留当前产出）", round_index + 1, repair_loops)
             break
-        logger.info("修复循环 %d/%d：对 %s 上游重查（仅必须字段缺口产品）",
+        logger.info("修复循环 %d/%d：对 %s 上游定点重查（必须字段缺口 + grounded 被拒字段）",
                     round_index + 1, repair_loops, targets)
         stage_started = time.monotonic()
-        try:
-            re_extracted = extract_products(
-                [record for record in registry.all() if record.canonical_id in targets],
-                source_index, gateway, config)
-        except (GatewayError, TokenBudgetExceeded) as exc:
-            logger.warning("修复循环重查未完成（%s），保留既有抽取结果", type(exc).__name__)
-            break
-        for cid, draft in re_extracted.items():
-            finals[cid] = reconcile_product(draft, source_index.by_product(cid), config)
+        for record in registry.all():
+            cid = record.canonical_id
+            if cid not in targets:
+                continue
+            try:
+                grounded_draft, rejected = extract_product_grounded(
+                    record, source_index.by_product(cid), gateway, config)
+            except (GatewayError, TokenBudgetExceeded) as exc:
+                logger.warning("修复循环重查产品 %s 未完成（%s），保留既有抽取结果",
+                               cid, type(exc).__name__)
+                continue
+            fused = fuse_product_drafts(
+                grounded_draft,
+                drafts.get(cid) or deterministic_product_draft(
+                    record, source_index.by_product(cid)))
+            new_final = reconcile_product(fused, source_index.by_product(cid), config)
+            if _nonempty_field_count(new_final) > _nonempty_field_count(finals.get(cid) or {}):
+                logger.info("修复循环：产品 %s 重查通过校验字段数提升（%d → %d），采纳",
+                            cid, _nonempty_field_count(finals.get(cid) or {}),
+                            _nonempty_field_count(new_final))
+                finals[cid] = new_final
+                drafts[cid] = fused
+                products_rejected[cid] = list(rejected)
+            else:
+                logger.info("修复循环：产品 %s 重查未提升通过校验字段数，保留原结果", cid)
+                products_rejected.pop(cid, None)
         gaps, optional_gaps = _partition_coverage_gaps(finals, registry)
         for gap in optional_gaps:
             logger.info("非必填字段缺口登记（不触发重查）：%s", gap)
