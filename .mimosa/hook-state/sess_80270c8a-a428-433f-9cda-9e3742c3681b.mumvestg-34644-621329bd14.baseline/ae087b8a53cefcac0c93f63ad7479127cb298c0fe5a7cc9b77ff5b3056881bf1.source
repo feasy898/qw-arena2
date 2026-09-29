@@ -611,7 +611,42 @@ def fuse_profile_fields(model_profile: dict, fallback_profile: dict) -> dict:
         value = model.get(key) or []
         merged[key] = list(value) if value else list(fallback.get(key) or [])
     scenes = model.get("scenes") or []
-    merged["scenes"] = list(scenes) if scenes else list(fallback.get("scenes") or [])
+    if scenes:
+        merged["scenes"] = list(scenes)
+        # 嵌套字段级兜底（local_eval 全用户实测后扩展）：模型场景条目缺任何
+        # 子字段（scene_evidence/scene_name/时长/频率/优先级类）时，按场景名
+        # 从 deterministic_profile 借值——scenes 子字段多为 OBJ_PROFILE_ITEM_
+        # REQUIRED 必填，缺失触发 high 级结构失败；正则侧 evidence 本身就是
+        # 原文子串，借用不破坏 grounding（local_eval 935/935 实证）。
+        fb_scenes = {s.get("scene_name"): s for s in (fallback.get("scenes") or [])
+                     if isinstance(s, dict) and s.get("scene_name")}
+        _EMPTY = (None, "", [], {})
+        # 可安全默认填充的子字段（官方判定顺序的合法第 3 档，非幻觉）：
+        # 优先级无原文依据时按官方口径标「优先级未明确」，键存在值合法
+        kept: list[dict] = []
+        for scene in merged["scenes"]:
+            if not isinstance(scene, dict):
+                continue
+            fb_scene = fb_scenes.get(scene.get("scene_name"))
+            if fb_scene is not None:
+                for child, fb_value in fb_scene.items():
+                    if scene.get(child) in _EMPTY and fb_value not in _EMPTY:
+                        scene[child] = fb_value
+            if scene.get("priority_basis") in _EMPTY:
+                scene["priority_basis"] = "优先级未明确"
+            if "scene_priority" not in scene:
+                scene["scene_priority"] = None
+            # 条目级最终防线（无法伪造的字段）：名称/原文依据缺失且正则
+            # 借不到 → 丢弃该条目（结构 fail 是 high 级全链失败，代价更大）
+            if (scene.get("scene_name") not in _EMPTY
+                    and scene.get("scene_evidence") not in _EMPTY):
+                kept.append(scene)
+            else:
+                logger.warning("融合丢弃不完整场景条目：%r（名称/原文依据缺失且正则无法补）",
+                               scene.get("scene_name"))
+        merged["scenes"] = kept or list(fallback.get("scenes") or [])
+    else:
+        merged["scenes"] = list(fallback.get("scenes") or [])
     return merged
 
 
