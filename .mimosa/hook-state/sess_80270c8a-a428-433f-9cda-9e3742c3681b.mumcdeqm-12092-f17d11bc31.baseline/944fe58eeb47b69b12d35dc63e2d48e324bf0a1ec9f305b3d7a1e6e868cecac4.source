@@ -5,17 +5,11 @@
 提取不到的保持空形态（渲染层落「未提供」），不编造数值、单位或品牌型号。
 
 - deterministic_profile：画像键与 profile_extractor.extract_profile_bundle 的画像半边一致。
-  首句提取称谓、性别、年龄；分句提取职业与城市。场景时长/频率只收指定短语；
-  优先级只在同句有明确主次措辞时填写；品类、期望类型与购买目的同样只收原文里已经写出的词。
-  设备只收「品牌名 + 手机/电脑/笔记本/平板」（另保留「阵营的X」点名的品牌）；
-  生态备注只收设备切换或生态分句，不并入预算句。
-  user_description_file 可选，只用来注入画像编号，不读用户正文里的编号指令。
+  场景时长/频率只收指定短语；优先级只在同句有明确主次措辞时填写；
+  品类、期望类型与购买目的同样只收原文里已经写出的词。
 - deterministic_product_draft：键集与 product_extractor.empty_draft 一致。
   品牌/型号在草稿里是身份标量；货架其余列与官网键值行写入 observation 列表
-  （FactCell 字典形态）。官网【型号】块写入产品类别、代际、核心功能（分号逐条）、
-  音频格式（原文格式名；没有具名格式、只写待核验时保留该句）和佩戴相关分句。
-  渠道宣称的水下蓝牙串流与第三方实测限制写入 bluetooth_underwater；两侧都抽到时
-  并列保留并标「存在冲突/待核验」，不择一。货架展示价的 normalized_value 取单元格纯数字，并用同行
+  （FactCell 字典形态）。货架展示价的 normalized_value 取单元格纯数字，并用同行
   平台原文作口径注记，以便和后写入的渠道报价区分。货架事实种类用「有依据归纳」
   （价格不用「实测观察」，也不用「官网声明」）；官网键值行用「官网声明」。
   媒体报道补渠道报价区间、含主打/采用/搭载/支持的卖点句（宣传表述，只进
@@ -58,10 +52,7 @@ _KIND_MARKETING = FactKind.MARKETING.value       # 宣传表述
 _KIND_FEEDBACK = FactKind.USER_FEEDBACK.value    # 用户反馈
 _STATUS_OK = FactStatus.SUPPORTED.value
 _STATUS_COND = FactStatus.CONDITIONAL.value
-_STATUS_CONFLICT = FactStatus.CONFLICTED.value
 _THIRD_PARTY_COND = "第三方实测"
-_CONFLICT_MARK = "存在冲突/待核验"
-_CHANNEL_CLAIM_COND = "渠道页面宣称"
 _SAMPLE_SHORT_NOTE = "样本不足，不构成共性"
 _SAMPLE_UNKNOWN_NOTE = "代表性未知，不能推及整体"
 
@@ -74,14 +65,9 @@ _BUDGET_RE = re.compile(
     r"\s*(?P<unit>元|块)"
     r"\s*(?P<suffix>左右|上下|以内|以下|之内|之间)?"
 )
-# 品牌名用拉丁字母（脱敏品牌如 Velmora）。任意汉字 +「手机」会把
-# 「希望耳机能和安卓手机」「不用带手机」误收成设备。
-_DEVICE_KIND = r"手机|电脑|笔记本|平板"
 _DEVICE_RE = re.compile(
-    rf"(?P<brand>[A-Za-z][A-Za-z0-9]{{1,24}})"
-    rf"(?:\s*的)?"
-    rf"\s*(?:{_DEVICE_KIND})"
-    rf"(?:\s*(?:和|与|、)\s*(?:{_DEVICE_KIND}))*"
+    r"(?P<brand>[A-Za-z][A-Za-z0-9]{1,24}|[\u4e00-\u9fff]{2,8})"
+    r"\s*的?\s*(?P<kind>手机|电脑|笔记本|平板)"
 )
 _CAMP_BRAND_RE = re.compile(r"阵营的([\u4e00-\u9fff]{2,8})")
 _PREFERENCE_BRAND_RE = re.compile(r"偏好\s*([^，。；\n]+)")
@@ -114,20 +100,6 @@ _CLAIM_WORD_RE = re.compile(r"主打|采用|搭载|(?<!不)支持")
 _COND_PHRASE_RE = re.compile(r"在[^。！？\n；]{1,40}?条件下")
 _MEASURED_WORD_RE = re.compile(r"实测|测得")
 _REVIEW_SENSE_RE = re.compile(r"实测|测试中")
-# 音频格式只收原文里已经写出的格式名（Larvo 大小写与官网一致）。
-_AUDIO_FORMAT_RE = re.compile(r"MP3|FLAC|WAV|WMA|AAC|PCM|APE|ALAC|OGG|AIFF|M4A|Larvo")
-# 佩戴方式：结构/形态，以及官网写明的耳塞、泳帽、泳镜条件。不把重量和防护等级算进来。
-_WEARING_RE = re.compile(r"佩戴|耳塞|泳帽|泳镜|可调结构|颈后|颈挂|入耳|头戴|挂耳")
-_UW_BT_CLAIM_RE = re.compile(r"蓝牙[^。；\n]{0,80}")
-_UW_LIMIT_PHRASES = (
-    "水下只能使用MP3模式",
-    "水下只能使用本地模式",
-    "水下蓝牙不可用",
-    "水下无法使用蓝牙",
-    "水下不支持蓝牙",
-)
-_UW_DENY_TOKENS = ("只能", "不可用", "不支持", "无法")
-_UW_ALLOW_TOKENS = ("串流", "可在水下", "在线播放")
 _DURATION_RE = re.compile(r"(?:最长\s*)?约?\s*\d+(?:\.\d+)?\s*小时")
 _PAREN_RE = re.compile(r"（([^）]{1,30})）")
 _NEG_BEFORE_RE = re.compile(r"(?:不会|没有|不太|不怎么|并不|不|没|无|未).{0,2}$")
@@ -202,58 +174,6 @@ _BRAND_STOP = frozenset({
 })
 _PREF_STOP = frozenset({"一些", "一下", "功能", "产品", "耳机", "可以", "能够"})
 
-# 称谓只在首句开头捕获。双字姓用复姓词表，不把任意两字当成姓。
-_TITLE_SUFFIX = ("先生", "女士", "小姐")
-_COMPOUND_SURNAMES = (
-    "欧阳", "太史", "端木", "上官", "司马", "东方", "独孤", "南宫",
-    "万俟", "闻人", "夏侯", "诸葛", "尉迟", "公羊", "赫连", "澹台",
-    "皇甫", "宗政", "濮阳", "公冶", "太叔", "申屠", "公孙", "慕容",
-    "仲孙", "钟离", "长孙", "宇文", "司徒", "鲜于", "司空", "闾丘",
-    "子车", "亓官", "司寇", "巫马", "公西", "颛孙", "壤驷", "公良",
-    "漆雕", "乐正", "宰父", "谷梁", "拓跋", "夹谷", "轩辕", "令狐",
-    "段干", "百里", "呼延", "东郭", "南门", "羊舌", "微生", "梁丘",
-    "左丘", "西门", "第五", "公乘", "南荣", "东里", "东宫", "仲长",
-    "子书", "子桑", "即墨", "达奚", "褚师",
-)
-_TITLED_NAME_RE = re.compile(r"^[\u4e00-\u9fff](?:先生|女士|小姐)")
-_XIAO_NAME_RE = re.compile(r"^小([\u4e00-\u9fff])")
-_GENDER_RE = re.compile(r"(?<![\u4e00-\u9fff])([男女])(?![\u4e00-\u9fff])")
-_AGE_RE = re.compile(r"([0-9]+)\s*岁")
-# 职业必须是原文子串。「做软件开发」取「软件开发」，不取「游泳爱好者」。
-_DO_JOB_RE = re.compile(
-    r"做(?P<job>"
-    r"产品经理|软件开发|软件工程师|硬件工程师|设计师|程序员|教师|老师|学生|工程师"
-    r"|[\u4e00-\u9fa5]{1,8}?(?:总监|经理)"
-    r")(?=[，,。；;！？!?\s、]|$)"
-)
-_SHI_JOB_RE = re.compile(
-    r"是(?:一名|一个)?(?P<job>[\u4e00-\u9fa5]{1,8}(?:总监|经理|者|员|师|家|生))"
-    r"(?=[，,。；;！？!?\s、]|$)"
-)
-_OPENING_SLOT_RE = re.compile(
-    r"^[^，,。\n]{1,12}[，,]\s*[0-9]+\s*岁[，,]\s*[男女][，,]\s*(?P<slot>[^，,。；;\n]+)"
-)
-_OCC_SLOT_RE = re.compile(
-    r"[\u4e00-\u9fa5A-Za-z0-9]{2,12}(?:总监|经理|者|员|师|家|生)"
-)
-# 城市只在「在某市 / 在某市一家」句式里取名单内的城市，不凭常识猜。
-_CITY_NAMES = (
-    "北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "南京",
-    "西安", "重庆", "天津", "苏州", "长沙", "青岛", "厦门", "宁波",
-    "无锡", "郑州", "合肥", "福州", "济南", "大连", "沈阳", "哈尔滨",
-    "长春", "昆明", "贵阳", "南宁", "南昌", "石家庄", "太原", "兰州",
-    "海口", "珠海", "东莞", "佛山", "温州", "金华", "泉州", "烟台",
-    "洛阳", "襄阳", "乌鲁木齐", "呼和浩特", "银川", "西宁", "拉萨",
-    "香港", "澳门", "台北",
-)
-_CITY_RE = re.compile(
-    r"在(" + "|".join(sorted(_CITY_NAMES, key=len, reverse=True)) + r")(?:市|一?家)?"
-)
-_PROFILE_FILENAME_NUMBER_RE = re.compile(r"User_Description_(\d+)")
-_CLAUSE_BREAK_RE = re.compile(r"[，,；;。！？!?\n]+")
-_PREF_CLAUSE_RE = re.compile(r"希望|需要|要求|喜欢|不想|不喜欢")
-_ECO_SWITCH_RE = re.compile(r"换成|换到|换用|阵营|生态|之前")
-
 # 货架列（表头优先；无表头时仅在列数与编号形态吻合时用样例列序）
 _LISTING_ROLES = (
     ("brand", lambda name: name == "品牌", 1),
@@ -304,125 +224,25 @@ def _status_for(text: str) -> str:
 # 画像
 # ---------------------------------------------------------------------------
 
-def deterministic_profile(user_text: str,
-                          user_description_file: str | None = None) -> dict:
+def deterministic_profile(user_text: str) -> dict:
     """从用户描述原文保守提取画像（无模型、无 needs）。
 
-    只填有原文依据的称谓、性别、年龄、职业、城市、预算、设备与生态、场景、
-    购买目标、明确偏好。提取不到保持空。
+    只填有原文依据的预算、设备与生态、场景、购买目标、明确偏好。
     场景时长/频率对不上指定短语时保持 None；没有明确主次措辞时不编优先级。
-
-    :param user_description_file: 用户描述文件名或路径（可选）。只解析其中的
-        User_Description_{n} 注入 profile_id；缺省 None 时不填编号（向后兼容）。
-        文件名其余内容与用户正文里的编号/职业指令都不执行。
     """
     text = user_text or ""
     profile = {key: None for key in _PROFILE_SCALARS}
     for key in _PROFILE_LISTS:
         profile[key] = []
     profile["scenes"] = []
-    profile_id = _profile_id_from_filename(user_description_file)
-    if profile_id is not None:
-        profile["profile_id"] = profile_id
     if not text.strip():
         return profile
-    _fill_identity(profile, text)
     _fill_budget(profile, text)
     _fill_devices(profile, text)
     _fill_scenes(profile, text)
     _fill_purchase_goals(profile, text)
     _fill_preferences(profile, text)
     return profile
-
-
-def _profile_id_from_filename(user_description_file: str | None) -> str | None:
-    """文件名（或路径）里的编号 → User_Description_n。解析不出则 None。"""
-    if not user_description_file:
-        return None
-    basename = Path(str(user_description_file)).name
-    match = _PROFILE_FILENAME_NUMBER_RE.search(basename)
-    if not match:
-        return None
-    return f"User_Description_{match.group(1)}"
-
-
-def _first_sentence(text: str) -> str:
-    parts = re.split(r"[。！？\n]", text, maxsplit=1)
-    return parts[0].strip()
-
-
-def _appellation(sentence: str) -> str | None:
-    """首句开头的称谓：复姓+先生/女士/小姐、单字姓+称谓，或「小X」。"""
-    for surname in _COMPOUND_SURNAMES:
-        for title in _TITLE_SUFFIX:
-            token = surname + title
-            if sentence.startswith(token):
-                return token
-    match = _TITLED_NAME_RE.match(sentence)
-    if match:
-        return match.group(0)
-    match = _XIAO_NAME_RE.match(sentence)
-    if match and match.group(1) != "姐":
-        return match.group(0)
-    return None
-
-
-def _opening_slot(sentence: str) -> str | None:
-    match = _OPENING_SLOT_RE.match(sentence)
-    if not match:
-        return None
-    slot = match.group("slot").strip()
-    return slot or None
-
-
-def _occupation(sentence: str, text: str) -> str | None:
-    """职业取原文子串。优先「做X」，其次首句性别后的职业槽，最后「是一名X」。"""
-    match = _DO_JOB_RE.search(text)
-    if match and match.group("job") in text:
-        return match.group("job")
-    slot = _opening_slot(sentence)
-    if slot and slot in text:
-        titled = _SHI_JOB_RE.search(slot)
-        if titled and titled.group("job") in text:
-            return titled.group("job")
-        if _OCC_SLOT_RE.fullmatch(slot):
-            return slot
-    match = _SHI_JOB_RE.search(text)
-    if match and match.group("job") in text:
-        return match.group("job")
-    return None
-
-
-def _city_name(text: str) -> str | None:
-    match = _CITY_RE.search(text)
-    if not match:
-        return None
-    city = match.group(1)
-    if city not in text:
-        return None
-    return city
-
-
-def _fill_identity(profile: dict, text: str) -> None:
-    """称谓/性别/年龄看首句；职业与城市按分句句式。提取不到就空。"""
-    sentence = _first_sentence(text)
-    if sentence:
-        name = _appellation(sentence)
-        if name and name in text:
-            profile["name"] = name
-        head = sentence[:40]
-        gender = _GENDER_RE.search(head)
-        if gender and gender.group(1) in text:
-            profile["gender"] = gender.group(1)
-        age = _AGE_RE.search(sentence)
-        if age and age.group(1) in sentence:
-            profile["age"] = int(age.group(1))
-    job = _occupation(sentence, text)
-    if job and job in text:
-        profile["occupation"] = job
-    city = _city_name(text)
-    if city:
-        profile["city"] = city
 
 
 def _fill_budget(profile: dict, text: str) -> None:
@@ -490,75 +310,11 @@ def _fill_devices(profile: dict, text: str) -> None:
         profile["ecosystem"] = "安卓"
     else:
         profile["ecosystem"] = found[0]
-    note = _ecosystem_note(text, devices, found)
-    if note and note in text and "预算" not in note:
-        profile["ecosystem_notes"] = note
-
-
-def _clause_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for match in _CLAUSE_BREAK_RE.finditer(text):
-        _append_clause_span(spans, text, cursor, match.start())
-        cursor = match.end()
-    _append_clause_span(spans, text, cursor, len(text))
-    return spans
-
-
-def _append_clause_span(spans: list[tuple[int, int]], text: str, start: int, end: int) -> None:
-    chunk = text[start:end]
-    stripped = chunk.strip()
-    if not stripped:
-        return
-    offset = chunk.find(stripped)
-    spans.append((start + offset, start + offset + len(stripped)))
-
-
-def _clause_is_ecosystem(clause: str, devices: list[str], eco_phrases: list[str]) -> bool:
-    """分句是否直接在说设备切换或系统生态。预算句和偏好句不算。"""
-    if not clause or "预算" in clause or _PREF_CLAUSE_RE.search(clause):
-        return False
-    if "换成" in clause or "换到" in clause or "换用" in clause:
-        return True
-    if "之前" in clause and "用" in clause:
-        return True
-    if "生态" in clause or "阵营" in clause:
-        return True
-    if any(phrase in clause for phrase in eco_phrases):
-        return True
-    return "用" in clause and any(device in clause for device in devices)
-
-
-def _ecosystem_snippet_ok(snippet: str, eco_phrases: list[str]) -> bool:
-    if any(phrase in snippet for phrase in eco_phrases):
-        return True
-    return bool(_ECO_SWITCH_RE.search(snippet))
-
-
-def _ecosystem_note(text: str, devices: list[str], eco_phrases: list[str]) -> str | None:
-    """相邻的生态/切换分句拼成原文里的连续子串，不跨过预算或偏好分句。"""
-    spans = _clause_spans(text)
-    flags = [
-        _clause_is_ecosystem(text[start:end], devices, eco_phrases)
-        for start, end in spans
-    ]
-    best = None
-    index = 0
-    total = len(spans)
-    while index < total:
-        if not flags[index]:
-            index += 1
-            continue
-        end_index = index
-        while end_index + 1 < total and flags[end_index + 1]:
-            end_index += 1
-        snippet = text[spans[index][0]:spans[end_index][1]]
-        if _ecosystem_snippet_ok(snippet, eco_phrases) and (
-            best is None or len(snippet) > len(best)
-        ):
-            best = snippet
-        index = end_index + 1
-    return best
+    for sentence in _sentences(text):
+        if "换成" in sentence or ("之前" in sentence and "用" in sentence):
+            if any(phrase in sentence for phrase in found) or any(item in sentence for item in devices):
+                profile["ecosystem_notes"] = sentence
+                break
 
 
 def _compound_scene_names(text: str) -> list[str]:
@@ -821,7 +577,6 @@ def deterministic_product_draft(record, source_records_for_product) -> dict:
         if _source_is(source, SourceType.THIRD_PARTY_REVIEW):
             _fill_review(draft, source)
     _fill_feedback(draft, records, header_cache)
-    _mark_bluetooth_underwater_conflict(draft)
     # 无官网型号块时，货架「型号」列原文可作身份型号（须与登记值相容）
     if not draft.get("product_name") and listing_model:
         if _model_compatible(listing_model, draft.get("model")):
@@ -1137,7 +892,6 @@ def _is_bluetooth_claim(clause: str) -> bool:
 
 
 def _fill_model_kv(draft, record, span_id, line, key, value, as_of) -> None:
-    _fill_official_model_fields(draft, record, span_id, line, key, value, as_of)
     if "降噪" in key:
         _append_obs(draft, "noise_cancellation", _observation(
             record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
@@ -1219,149 +973,6 @@ def _fill_model_kv(draft, record, span_id, line, key, value, as_of) -> None:
                 fact_kind=_KIND_OFFICIAL, raw_value=raw,
                 status=_STATUS_COND, as_of=as_of,
             ))
-
-
-def _fill_official_model_fields(draft, record, span_id, line, key, value, as_of) -> None:
-    """官网【型号】块：品类、代际、核心功能、音频格式、佩戴。对不上的键不写。"""
-    clauses = [clause for clause in _clauses(value) if clause in line]
-    # 「产品类别」含有「品类」二字，不能用「品类」做排除，否则会把品类行整行丢掉。
-    if ("产品类别" in key or key == "类别") and value in line:
-        _append_obs(draft, "category", _observation(
-            record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
-            status=_status_for(value), as_of=as_of,
-        ))
-    if "代际" in key and value in line:
-        _append_obs(draft, "generation", _observation(
-            record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
-            status=_status_for(value), as_of=as_of,
-        ))
-    if "核心功能" in key and clauses:
-        _append_obs(draft, "core_functions", _observation(
-            record, span_id, line, fact_kind=_KIND_OFFICIAL, items=clauses,
-            status=_status_for(value), as_of=as_of,
-        ))
-        _append_audio_formats(draft, record, span_id, line, value, clauses, as_of)
-    elif "格式" in key:
-        _append_audio_formats(draft, record, span_id, line, value, clauses, as_of)
-    # 同一键值行里多条佩戴分句收成一段连续原文。拆成多条观察后，归并会把
-    # 「颈后式开放佩戴」和「含游泳耳塞」当成取值冲突并标待核验。
-    if ("佩戴" in key or "核心功能" in key) and not draft.get("wearing_design"):
-        span = _wearing_span(line, clauses)
-        if span:
-            _append_obs(draft, "wearing_design", _observation(
-                record, span_id, span, fact_kind=_KIND_OFFICIAL, raw_value=span,
-                status=_status_for(span), as_of=as_of,
-            ))
-
-
-def _wearing_span(line: str, clauses: list[str]) -> str | None:
-    """从第一条佩戴分句到最后一条的连续原文。没有佩戴分句则返回 None。"""
-    hits = [clause for clause in clauses if _WEARING_RE.search(clause) and clause in line]
-    if not hits:
-        return None
-    start = line.find(hits[0])
-    end = line.find(hits[-1])
-    if start < 0 or end < 0:
-        return None
-    end += len(hits[-1])
-    if end <= start:
-        return None
-    span = line[start:end]
-    if hits[0] not in span or hits[-1] not in span or span not in line:
-        return None
-    return span
-
-
-def _append_audio_formats(draft, record, span_id, line, value, clauses, as_of) -> None:
-    formats = []
-    for match in _AUDIO_FORMAT_RE.finditer(value):
-        token = match.group(0)
-        if token not in formats and token in line:
-            formats.append(token)
-    if formats:
-        _append_obs(draft, "audio_formats", _observation(
-            record, span_id, line, fact_kind=_KIND_OFFICIAL, items=formats,
-            status=_status_for(value), as_of=as_of,
-        ))
-        return
-    for clause in clauses:
-        if "格式" not in clause:
-            continue
-        _append_obs(draft, "audio_formats", _observation(
-            record, span_id, clause, fact_kind=_KIND_OFFICIAL, items=[clause],
-            status=_status_for(clause), as_of=as_of,
-        ))
-        return
-
-
-def _channel_underwater_claim(sentence: str) -> str | None:
-    """渠道宣称里的水下蓝牙串流原文。没有「宣称」或没有蓝牙+水下则返回 None。"""
-    if "宣称" not in sentence or "蓝牙" not in sentence or "水下" not in sentence:
-        return None
-    match = _UW_BT_CLAIM_RE.search(sentence)
-    if not match:
-        return None
-    claim = match.group(0).strip("，,；; ")
-    if not claim or claim not in sentence:
-        return None
-    if "水下" not in claim and "串流" not in claim:
-        return None
-    return claim
-
-
-def _append_underwater_limit(draft, record, span_id, sentence, as_of) -> None:
-    """第三方实测里点名的水下蓝牙限制。与已有同文观察不重复。"""
-    text = getattr(record, "original_text", "") or ""
-    if sentence not in text:
-        return
-    existing = {
-        obs.get("raw_value")
-        for obs in (draft.get("bluetooth_underwater") or [])
-    }
-    for phrase in _UW_LIMIT_PHRASES:
-        if phrase not in sentence or phrase in existing:
-            continue
-        _append_obs(draft, "bluetooth_underwater", _observation(
-            record, span_id, phrase, fact_kind=_KIND_MEASURED, raw_value=phrase,
-            status=_STATUS_COND, as_of=as_of, conditions=[_THIRD_PARTY_COND],
-        ))
-        existing.add(phrase)
-
-
-def _underwater_denied(text: str) -> bool:
-    return any(token in text for token in _UW_DENY_TOKENS)
-
-
-def _underwater_allowed(text: str) -> bool:
-    if _underwater_denied(text):
-        return False
-    return any(token in text for token in _UW_ALLOW_TOKENS)
-
-
-def _mark_bluetooth_underwater_conflict(draft: dict) -> None:
-    """水下能串流 vs 水下只能本地播放：并列两条观察并标存在冲突/待核验。
-
-    样例中「蓝牙5.4可在水下…串流」出自媒体报道里的渠道页面宣称，不是官网页。
-    与第三方实测「水下只能使用MP3模式」按冲突三步法③并列，不择一。
-    两侧没有同时抽到，或两边说法一致（如官网与实测都写水下蓝牙不可用）时不标冲突。
-    """
-    rows = draft.get("bluetooth_underwater") or []
-    denies = []
-    allows = []
-    for obs in rows:
-        text = str(obs.get("raw_value") or "")
-        if _underwater_denied(text):
-            denies.append(obs)
-        elif _underwater_allowed(text):
-            allows.append(obs)
-    if not denies or not allows:
-        return
-    for obs in denies + allows:
-        conditions = list(obs.get("conditions") or [])
-        if _CONFLICT_MARK not in conditions:
-            conditions.append(_CONFLICT_MARK)
-        obs["conditions"] = conditions
-        obs["status"] = _STATUS_CONFLICT
 
 
 def _append_storage(draft, record, span_id, clause, as_of) -> None:
@@ -1540,15 +1151,6 @@ def _fill_media(draft: dict, record) -> None:
                     raw_value=sentence, status=_STATUS_COND, as_of=as_of,
                     conditions=conditions,
                 ))
-        for sentence in _sentences(line):
-            claim = _channel_underwater_claim(sentence)
-            if not claim or sentence not in line:
-                continue
-            _append_obs(draft, "bluetooth_underwater", _observation(
-                record, span_id, sentence, fact_kind=_KIND_MARKETING,
-                raw_value=claim, status=_STATUS_OK, as_of=as_of,
-                conditions=[_CHANNEL_CLAIM_COND],
-            ))
 
 
 def _fill_review(draft: dict, record) -> None:
@@ -1560,7 +1162,6 @@ def _fill_review(draft: dict, record) -> None:
                 continue
             _append_measured_battery(draft, record, span_id, sentence, as_of)
             _append_measured_sense(draft, record, span_id, sentence, as_of)
-            _append_underwater_limit(draft, record, span_id, sentence, as_of)
 
 
 def _append_measured_battery(draft, record, span_id, sentence, as_of) -> None:
