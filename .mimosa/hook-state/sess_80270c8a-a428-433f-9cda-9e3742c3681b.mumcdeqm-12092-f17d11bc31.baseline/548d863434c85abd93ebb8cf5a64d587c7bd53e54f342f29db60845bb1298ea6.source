@@ -1,0 +1,223 @@
+# -*- coding: utf-8 -*-
+"""tools/e2e_real.py — 真实模型端到端联调（第二阶段；**本地工具，绝不打进提交包**）。
+
+流程（与 tools/e2e_mock.py 同构，差异：真实网关 + 密钥注入 + usage 汇总）：
+1. 凭据：环境变量 ``DASHSCOPE_API_KEY``/``OPENAI_BASE_URL`` 已设则优先；
+   否则读 ``.secrets/dashscope_api_key.txt`` 与 ``.secrets/base_url.txt``
+   （Key 只进子进程环境变量，绝不打印/写日志/写文档）；
+2. 以 ``raw/dataset_sample/Data_for_Users`` 为资料池构造**单用户**输入目录
+   （官方输入模型 = 恰 1 份用户描述；默认 ``--user 1``，复制 01–04 五源产品资料
+   + 仅 ``User_Description_{n}.txt``）；
+3. **子进程**运行 ``python agent/agent.py --prompt "…输入目录…输出目录…"``
+   （与平台调用方式一致），注入 ``DASHSCOPE_API_KEY``/``OPENAI_BASE_URL``/
+   ``AGENT_LOG_DIR``（本次运行独立日志目录，Key 不落日志）；
+4. 调 ``tools/evaluate.py`` 的 evaluate() 做全部确定性校验（JSON 报告打印到 stdout）；
+5. 从 agent.log 提取各阶段耗时与「usage 汇总」行（src/pipeline.run 兜底输出，
+   成功/失败路径均有），打印汇总；
+6. 按结果退出 0/1。单次完整运行 usage 总量超过 ``TOKEN_STOP_LIMIT``（200 万
+   tokens）→ 立即打印停止标记并以非 0 退出（调用方升级处理，不再发起运行）。
+
+费用纪律（任务书）：本阶段测试预算 ≤20 元；每次真实调用后记录 usage 的
+prompt/completion tokens 并汇总；绝不打印 Key。
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+DATA_POOL = REPO_ROOT / "raw" / "dataset_sample" / "Data_for_Users"
+OUT_ROOT = REPO_ROOT / "reports" / "e2e_real_output"
+SECRETS_DIR = REPO_ROOT / ".secrets"
+KEY_FILE = SECRETS_DIR / "dashscope_api_key.txt"
+BASE_URL_FILE = SECRETS_DIR / "base_url.txt"
+SOURCE_DIRS = (
+    "01_Ecommerce_Listings",
+    "02_Media_Coverage_and_Reviews",
+    "03_User_Feedback_and_Complaints",
+    "04_Brand_Official_Sites",
+)
+OUTPUT_FILES = ("user_profile.md", "product_list.md", "recommendation.md")
+SUBPROCESS_TIMEOUT_SECONDS = 1800  # 平台硬截止口径；子进程内部软截止 1680s
+TOKEN_STOP_LIMIT = 2_000_000      # 单次完整运行 usage 上限（任务书），超过即停
+
+USAGE_SUMMARY_RE = re.compile(
+    r"usage 汇总 prompt=(\d+) completion=(\d+) total=(\d+) requests=(\d+)")
+STAGE_LINE_RE = re.compile(r"阶段 (.+) 完成，耗时 ([0-9.]+)s")
+
+
+def _reset_dir(path: Path) -> Path:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    return path
+
+
+def _read_secret(path: Path, env_value: str, what: str) -> str:
+    """环境变量优先，其次 .secrets 文件；都缺失则报错退出（值不打印）。"""
+    value = (env_value or "").strip()
+    if value:
+        print(f"[e2e-real] {what}：来自环境变量（已设，长度 {len(value)}）")
+        return value
+    if not path.is_file():
+        print(f"[e2e-real] {what} 缺失：环境变量未设且 {path} 不存在")
+        raise SystemExit(1)
+    value = path.read_text(encoding="utf-8").strip()
+    if not value:
+        print(f"[e2e-real] {what} 文件为空：{path}")
+        raise SystemExit(1)
+    print(f"[e2e-real] {what}：来自 {path.relative_to(REPO_ROOT)}（长度 {len(value)}）")
+    return value
+
+
+def resolve_credentials() -> tuple[str, str]:
+    """(api_key, base_url)：env 优先，其次 .secrets；Key 不落任何输出。"""
+    key = _read_secret(KEY_FILE, os.environ.get("DASHSCOPE_API_KEY", ""), "DASHSCOPE_API_KEY")
+    base = _read_secret(BASE_URL_FILE, os.environ.get("OPENAI_BASE_URL", ""), "OPENAI_BASE_URL")
+    if key == "mock":
+        print("[e2e-real] DASHSCOPE_API_KEY == 'mock'，真实网关会判为 mock 模式，拒绝运行")
+        raise SystemExit(1)
+    return key, base
+
+
+def build_single_user_input(staging: Path, user_file: str) -> Path:
+    """资料池 → 单用户输入目录（恰 1 份用户描述 + 全部五源产品资料）。"""
+    staging = _reset_dir(staging)
+    desc_dir = staging / "00_User_Descriptions"
+    desc_dir.mkdir()
+    shutil.copy2(DATA_POOL / "00_User_Descriptions" / user_file, desc_dir / user_file)
+    for dirname in SOURCE_DIRS:
+        shutil.copytree(DATA_POOL / dirname, staging / dirname)
+    return staging
+
+
+def run_agent(input_dir: Path, output_dir: Path, credentials: tuple[str, str],
+              log_dir: Path) -> tuple[int, float, str, str]:
+    """子进程运行 agent/agent.py --prompt（真实网关；密钥经环境变量注入）。"""
+    prompt = (f"请根据 {input_dir} 中的数据完成消费决策任务，"
+              f"将结果输出到 {output_dir}")
+    env = dict(os.environ)
+    env.pop("QW_FORCE_MOCK", None)  # 防止外层误留强制 mock 标记
+    env["DASHSCOPE_API_KEY"] = credentials[0]
+    env["OPENAI_BASE_URL"] = credentials[1]
+    env["AGENT_LOG_DIR"] = str(log_dir)
+    started = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "agent" / "agent.py"), "--prompt", prompt],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+    elapsed = time.monotonic() - started
+    return proc.returncode, elapsed, proc.stdout, proc.stderr
+
+
+def read_log(log_dir: Path) -> str:
+    path = log_dir / "agent.log"
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def parse_usage(log_text: str) -> dict | None:
+    """从日志提取最后一次「usage 汇总」行（run() finally 兜底输出，成败都有）。"""
+    matches = USAGE_SUMMARY_RE.findall(log_text or "")
+    if not matches:
+        return None
+    prompt, completion, total, requests = (int(x) for x in matches[-1])
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": total, "requests": requests}
+
+
+def parse_stage_timings(log_text: str) -> list[tuple[str, float]]:
+    """从日志提取各阶段耗时行（log_stage 输出，按出现顺序）。"""
+    return STAGE_LINE_RE.findall(log_text or "")
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    parser = argparse.ArgumentParser(description="真实模型端到端联调（本地工具）")
+    parser.add_argument("--user", type=int, default=1,
+                        help="用户描述编号 n（User_Description_{n}.txt，默认 1）")
+    args = parser.parse_args(argv)
+
+    if not DATA_POOL.is_dir():
+        print(f"[e2e-real] 样例资料池不存在：{DATA_POOL}")
+        return 1
+    user_file = f"User_Description_{args.user}.txt"
+    if not (DATA_POOL / "00_User_Descriptions" / user_file).is_file():
+        print(f"[e2e-real] 用户描述不存在：{user_file}")
+        return 1
+
+    run_started = time.monotonic()
+    try:
+        credentials = resolve_credentials()
+    except SystemExit:
+        return 1
+
+    input_dir = build_single_user_input(OUT_ROOT / f"_input_user{args.user}", user_file)
+    output_dir = _reset_dir(OUT_ROOT / user_file.removesuffix(".txt"))
+    log_dir = _reset_dir(REPO_ROOT / "reports" / "logs" / "e2e_real" / user_file.removesuffix(".txt"))
+    print(f"[e2e-real] 输入目录（单用户构造）：{input_dir}")
+    print(f"[e2e-real] 输出目录：{output_dir}")
+    print(f"[e2e-real] agent 日志目录：{log_dir}")
+    print(f"[e2e-real] 凭据注入子进程环境变量（Key 不打印）")
+
+    code, elapsed, stdout, stderr = run_agent(input_dir, output_dir, credentials, log_dir)
+    print(f"[e2e-real] agent/agent.py --prompt 退出码={code} 耗时={elapsed:.2f}s")
+    if stdout.strip():
+        print("[e2e-real] agent stdout 摘要：\n" + "\n".join(stdout.strip().splitlines()[-5:]))
+    if stderr.strip():
+        print("[e2e-real] agent stderr 摘要：\n" + "\n".join(stderr.strip().splitlines()[-15:]))
+
+    log_text = read_log(log_dir)
+    stages = parse_stage_timings(log_text)
+    if stages:
+        print("[e2e-real] 各阶段耗时（来自 agent.log）：")
+        for stage_name, seconds in stages:
+            print(f"  - {stage_name}: {seconds}s")
+
+    usage = parse_usage(log_text)
+    usage_line = "未提取到（日志缺「usage 汇总」行）"
+    if usage:
+        usage_line = (f"prompt={usage['prompt_tokens']} completion={usage['completion_tokens']} "
+                      f"total={usage['total_tokens']} requests={usage['requests']}")
+        print(f"[e2e-real] usage 汇总：{usage_line}")
+        if usage["total_tokens"] > TOKEN_STOP_LIMIT:
+            print(f"[e2e-real] !! 单次完整运行 usage={usage['total_tokens']} 超过上限 "
+                  f"{TOKEN_STOP_LIMIT}：立即停止（任务书费用纪律），请升级处理")
+            return 1
+    else:
+        print(f"[e2e-real] usage 汇总：{usage_line}")
+
+    from tools.evaluate import evaluate
+
+    eval_started = time.monotonic()
+    eval_code = evaluate(input_dir, output_dir, run_seconds=elapsed)
+    eval_elapsed = time.monotonic() - eval_started
+    total_elapsed = time.monotonic() - run_started
+
+    files_ok = all((output_dir / name).is_file() for name in OUTPUT_FILES)
+    ok = (code == 0 and eval_code == 0 and files_ok)
+    print("=" * 72)
+    print(f"[e2e-real] 摘要：agent 退出码={code}；evaluate 退出码={eval_code}"
+          f"（耗时 {eval_elapsed:.2f}s）；三份产物齐全={files_ok}")
+    print(f"[e2e-real] usage：{usage_line}")
+    print(f"[e2e-real] 总耗时={total_elapsed:.2f}s")
+    print(f"[e2e-real] 结论：{'通过（真实模型全链 + 全部确定性校验）' if ok else '未通过'}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

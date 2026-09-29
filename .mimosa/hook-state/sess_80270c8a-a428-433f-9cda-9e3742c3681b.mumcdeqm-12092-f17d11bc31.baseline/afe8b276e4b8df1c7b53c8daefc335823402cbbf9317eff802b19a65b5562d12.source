@@ -1,0 +1,231 @@
+# -*- coding: utf-8 -*-
+"""tests/unit/test_audit_fixes.py — 第一阶段审计遗留修复（5 项低级发现）回归测试。
+
+对应发现（原发现摘录见任务书；代码落点见各测试 docstring）：
+- 发现2：selector「无足够新增价值」分支的条件句删固定例举，由实际属性生成；
+- 发现3：综合结论按官方句面生成「偏好取向→选哪款」映射（真实差异字段）；
+- 发现5：修复循环重查目标只保留 field_catalog 必须字段缺口（reconciler
+  find_coverage_gaps 新增 include_optional 兼容扩展 + pipeline 缺口两分）；
+- 发现4：prompts 两份模板输出示例改为明显虚构占位（防示例值污染）。
+
+数据口径同 test_constraint_engine / test_reconciler（黄金夹具 → 真实链路回读）。
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from src import pipeline as pipeline_mod
+from src.input_adapter import load_input
+from src.pipeline import _partition_coverage_gaps
+from src.product_registry import build_registry
+from src.reconciler import find_coverage_gaps, reconcile_product
+from src.selector import _primary_price, select_recommendation
+from src import constraint_engine as ce
+
+from tests.unit.test_constraint_engine import load_products, swim_profile
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EVAL_VALID_INPUT = REPO_ROOT / "tests" / "fixtures" / "eval" / "valid" / "input"
+
+
+@pytest.fixture(scope="module")
+def products():
+    return load_products()
+
+
+@pytest.fixture(scope="module")
+def p004_no_added_value_record(products):
+    """游泳用户 3+ 款有效用例中 P004 的未选原因行（类别=无足够新增价值）。"""
+    plan = _plan_for(swim_profile(), products)
+    return next(r for r in plan.excluded_products if r.product_ids == ["P004"])
+
+
+def _plan_for(profile, products):
+    matrix = ce.constraint_matrix(profile, products)
+    return select_recommendation(profile, products, matrix)
+
+
+# ---------------------------------------------------------------------------
+# 发现2：「无足够新增价值」条件句由实际属性生成（删固定例举）
+# ---------------------------------------------------------------------------
+
+class TestNoAddedValueConditionsFromRealAttributes:
+    def test_category_is_no_added_value(self, p004_no_added_value_record):
+        assert p004_no_added_value_record.reason_category == "无足够新增价值"
+
+    def test_fixed_example_phrases_removed(self, p004_no_added_value_record):
+        """固定例举「（如价格最低、形态不同）」不得再出现（审计原发现）。"""
+        for condition in p004_no_added_value_record.change_conditions:
+            assert "如价格最低、形态不同" not in condition
+            assert "（如" not in condition, condition
+
+    def test_conditions_derived_from_real_attributes(self, p004_no_added_value_record):
+        """条件句由 P004 实际字段生成：展示价 456 元为有效候选最低、续航 12 小时最长。"""
+        conditions = p004_no_added_value_record.change_conditions
+        assert conditions, "条件句不得为空"
+        assert any("当前售价" in c and "456" in c for c in conditions)
+        assert any("续航" in c and "12" in c for c in conditions)
+        # 条件句引用落在真实字段（validators E8 口径可校验的引用格式）
+        assert all("「产品属性｜P004｜" in c for c in conditions)
+
+    def test_validate_plan_still_passes_with_new_conditions(self, products):
+        from src.validators import validate_plan
+
+        plan = _plan_for(swim_profile(), products)
+        assert validate_plan(plan, products) == []
+
+
+# ---------------------------------------------------------------------------
+# 发现3：综合结论的「偏好取向→选哪款」映射
+# ---------------------------------------------------------------------------
+
+class TestOverallConclusionOrientationMapping:
+    def test_three_valid_case_maps_orientation_to_products(self, products):
+        plan = _plan_for(swim_profile(), products)
+        assert plan.selected_products == ["P001", "P005", "P003"]
+        assert "偏好取向" in plan.overall_conclusion
+        orientation = plan.overall_conclusion.split("偏好取向", 1)[1]
+        # P001 展示价 1098 元为入选三款最低 → 「更低价格」取向映射到首选 P001
+        assert "偏好更低价格选首选P001" in orientation
+        # 存储 P001/P005 并列 32GB、P005 无防水口径 → 并列/缺失维度不指派取向
+        assert "P005" not in orientation
+
+    def test_orientation_winner_matches_real_field_values(self, products):
+        """取向句的被指派者必须是该维度在入选款中的严格最优（用真实字段复核）。"""
+        plan = _plan_for(swim_profile(), products)
+        selected = plan.selected_products
+        prices = {pid: _primary_price(products.get(pid) or {}) for pid in selected}
+        cheapest = min(prices, key=lambda p: prices[p])
+        assert cheapest in plan.overall_conclusion.split("偏好取向", 1)[1]
+
+    def test_two_valid_case_multi_dimension_mapping(self, products):
+        profile = swim_profile(budget_min=1000, budget_max=1100)
+        plan = _plan_for(profile, products)
+        assert plan.selected_products == ["P001", "P004"]
+        assert "偏好更大存储选首选P001" in plan.overall_conclusion
+        assert "偏好更低价格、更长续航选备选1P004" in plan.overall_conclusion
+
+    def test_no_uncalibrated_scores_added(self, products):
+        """取向映射不得引入无口径总分（SPEC §9；「综合匹配度93.7」类）。"""
+        plan = _plan_for(swim_profile(), products)
+        assert "匹配度" not in plan.overall_conclusion
+
+    def test_single_valid_case_has_no_orientation_section(self, products):
+        plan = _plan_for(swim_profile(budget_min=400, budget_max=500), products)
+        assert plan.selected_products == ["P004"]
+        assert "仅P004" in plan.overall_conclusion  # 既有句面保持
+        assert "偏好取向" not in plan.overall_conclusion
+
+    def test_zero_valid_case_unchanged(self, products):
+        plan = _plan_for(swim_profile(budget_min=200, budget_max=300), products)
+        assert "无法支持直接购买建议" in plan.overall_conclusion
+
+
+# ---------------------------------------------------------------------------
+# 发现5：重查目标只保留必须字段缺口（reconciler include_optional + pipeline 两分）
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def mini_finals():
+    """eval valid mini 输入 → registry{P001,P002}；P001 极简终稿（多数字段缺失）。"""
+    bundle = load_input(EVAL_VALID_INPUT)
+    registry = build_registry(bundle.source_records)
+    draft = {"canonical_id": "P001", "aliases": ["P001"],
+             "product_name": None, "brand": None, "model": None}
+    final = {"P001": reconcile_product(draft, [], {})}
+    return registry, final
+
+
+class TestRequiredOnlyRequeryTargets:
+    def test_default_behavior_unchanged_required_only_no_flag(self, mini_finals):
+        """缺省（契约行为）：仅必须字段缺口，dict 不含 required 键。"""
+        registry, final = mini_finals
+        gaps = find_coverage_gaps(final, registry)
+        assert gaps, "极简终稿必有必须字段缺口"
+        assert all("required" not in g for g in gaps)
+        field_keys = {g["field_key"] for g in gaps if g["field_key"] is not None}
+        assert "sales_volume" in field_keys            # 必须字段缺口在列
+        assert "weight_g" not in field_keys            # 非必填缺口不出现
+        assert "call_capability" not in field_keys
+
+    def test_include_optional_marks_required_flag(self, mini_finals):
+        registry, final = mini_finals
+        gaps = find_coverage_gaps(final, registry, include_optional=True)
+        assert all("required" in g for g in gaps)
+        by_key = {(g["canonical_id"], g["field_key"]): g["required"] for g in gaps}
+        # 必须字段缺口（field_catalog required=true）
+        assert by_key[("P001", "sales_volume")] is True
+        assert by_key[("P001", "current_price")] is True
+        # 非必填字段缺口（field_catalog required=false）：登记但不得触发重查
+        assert by_key[("P001", "weight_g")] is False
+        assert by_key[("P001", "call_capability")] is False
+
+    def test_whole_missing_product_is_required(self, mini_finals):
+        registry, _final = mini_finals
+        gaps = find_coverage_gaps({}, registry, include_optional=True)
+        assert gaps, "终稿为空时全部产品整体缺失"
+        whole = [g for g in gaps if g["field_key"] is None]
+        assert whole and all(g["required"] is True for g in whole)
+
+    def test_pipeline_partition_splits_required_and_optional(self, mini_finals):
+        registry, final = mini_finals
+        required, optional = _partition_coverage_gaps(final, registry)
+        assert all(g.get("required", True) for g in required)
+        assert all(not g.get("required", True) for g in optional)
+        assert ("P001", "weight_g") in {(g["canonical_id"], g["field_key"]) for g in optional}
+        assert ("P001", "sales_volume") in {(g["canonical_id"], g["field_key"]) for g in required}
+
+    def test_partition_with_no_optional_gaps(self, monkeypatch):
+        canned = [{"canonical_id": "P001", "field_key": "sales_volume",
+                   "gap": "缺失", "required": True}]
+
+        def fake_find_coverage_gaps(finals, registry, *, include_optional=False):
+            return [dict(g) for g in canned]
+
+        monkeypatch.setattr(pipeline_mod, "find_coverage_gaps", fake_find_coverage_gaps)
+        required, optional = _partition_coverage_gaps({}, None)
+        assert len(required) == 1 and optional == []
+
+
+# ---------------------------------------------------------------------------
+# 发现4：prompts 示例值改为明显虚构占位（防示例值污染）
+# ---------------------------------------------------------------------------
+
+PROMPTS_DIR = REPO_ROOT / "prompts"
+FORBIDDEN_REAL_VALUES = (
+    # User_Description_1 真实取值
+    "User_Description_1", "小王", "Velmora", "禾岚",
+    # 数据集真实产品取值
+    "Ralun", "Zurmek", "骨传导游泳耳机", "蓝牙5.4",
+)
+REQUIRED_PLACEHOLDERS = {
+    "profile_extraction.md": ("{{USER_TEXT}}", "User_Description_n", "示例品牌甲",
+                              "虚构", "8888"),
+    "product_extraction.md": ("{{PRODUCT_ID}}", "{{PRODUCT_ALIASES}}",
+                              "{{SOURCES_BLOCK}}", "虚构品牌甲", "示例型号 Alpha"),
+}
+
+
+class TestPromptExampleHygiene:
+    @pytest.mark.parametrize("name", sorted(REQUIRED_PLACEHOLDERS))
+    def test_no_real_dataset_values_in_prompt(self, name):
+        text = (PROMPTS_DIR / name).read_text(encoding="utf-8")
+        for value in FORBIDDEN_REAL_VALUES:
+            assert value not in text, f"{name} 仍含数据集真实取值「{value}」"
+
+    @pytest.mark.parametrize("name", sorted(REQUIRED_PLACEHOLDERS))
+    def test_placeholder_markers_present(self, name):
+        text = (PROMPTS_DIR / name).read_text(encoding="utf-8")
+        for marker in REQUIRED_PLACEHOLDERS[name]:
+            assert marker in text, f"{name} 缺少占位标记「{marker}」"
+
+    def test_extractor_placeholder_contract_intact(self):
+        """占位符契约定不变（src/profile_extractor.py、src/product_extractor.py 渲染依赖）。"""
+        profile_text = (PROMPTS_DIR / "profile_extraction.md").read_text(encoding="utf-8")
+        product_text = (PROMPTS_DIR / "product_extraction.md").read_text(encoding="utf-8")
+        assert profile_text.count("{{USER_TEXT}}") == 1
+        for placeholder in ("{{PRODUCT_ID}}", "{{PRODUCT_ALIASES}}", "{{SOURCES_BLOCK}}"):
+            assert product_text.count(placeholder) == 1
