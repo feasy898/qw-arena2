@@ -74,7 +74,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.4.14"
+VERSION = "0.4.18"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -458,7 +458,9 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
     registry = build_registry(bundle_in.source_records)
     source_index = SourceIndex(bundle_in.source_records)
     log_stage(logger, "load_input+registry", stage_started)
-    logger.info("产品全集=%s 用户描述=%s", registry.ids(), Path(user_description_path).name)
+    # 文件名只用于解析画像编号（降级与模型路径同一来源），不进入提示词正文
+    user_description_name = Path(user_description_path).name
+    logger.info("产品全集=%s 用户描述=%s", registry.ids(), user_description_name)
     for warning in bundle_in.warnings:
         logger.warning("输入侧提示：%s", warning)
 
@@ -469,7 +471,8 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
     if degrade_template:
         # v0.4.5（平台评测联调）：降级路径改用确定性抽取器（grok 实现）——从原文
         # 保守提取确凿字段（预算数字/设备/场景/货架列/官网键值行），远好于全空表
-        profile: dict = deterministic_profile(user_text)
+        profile: dict = deterministic_profile(
+            user_text, user_description_file=user_description_name)
         logger.warning("模型路径不可用或已达 template_only 降级：画像走确定性抽取"
                        "（确凿字段填充，未知如实保留）")
     else:
@@ -479,10 +482,11 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
             # （文件名只用于解析编号，不进入提示词正文——防提示注入纪律）
             profile, _model_needs = extract_profile_bundle(
                 user_text, gateway, config,
-                user_description_file=Path(user_description_path).name)
+                user_description_file=user_description_name)
         except TokenBudgetExceeded:
             degrade_template = True
-            profile = deterministic_profile(user_text)
+            profile = deterministic_profile(
+                user_text, user_description_file=user_description_name)
             logger.warning("token 预算超限：画像降级为确定性抽取（未知如实保留），"
                            "后续模型调用停用（禁止丢产品）")
         except (GatewayError, UpstreamFatalError) as exc:
@@ -490,7 +494,8 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
             # 且候选链耗尽/鉴权失败）→ 画像与产品全部走确定性空草稿，仍产出结构
             # 完整的三份文档退出 0，评测按结构维度给分而非记 0 分。
             degrade_template = True
-            profile = deterministic_profile(user_text)
+            profile = deterministic_profile(
+                user_text, user_description_file=user_description_name)
             logger.error("画像抽取模型失败（%s: %s）：画像降级为确定性抽取"
                          "（确凿字段填充，未知如实保留）", type(exc).__name__, exc)
     log_stage(logger, "extract_profile", stage_started)
