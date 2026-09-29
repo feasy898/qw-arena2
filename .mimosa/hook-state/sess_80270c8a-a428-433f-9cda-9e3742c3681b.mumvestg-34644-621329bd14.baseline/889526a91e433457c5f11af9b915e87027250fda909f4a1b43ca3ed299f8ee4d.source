@@ -1,0 +1,49 @@
+# 构建带 Edge 登录态的 requests.Session，供抓取 qianwenai.com 接口使用。
+import json
+import os
+from urllib.parse import urlparse
+
+import requests
+
+COOKIE_FILE = os.path.join(os.path.dirname(__file__), "..", ".secrets", "edge_cookies.json")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def load_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+    with open(os.path.abspath(COOKIE_FILE), "r", encoding="utf-8") as f:
+        cookies = json.load(f)
+    for c in cookies:
+        if not c.get("value"):
+            continue
+        try:
+            c["value"].encode("latin-1")
+        except UnicodeEncodeError:
+            continue  # 解密失败的脏值，跳过
+        s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+    return s
+
+
+def cookie_header_for(url: str) -> str:
+    """按浏览器规则挑出对该 URL 应发送的 Cookie（域名后缀匹配）。"""
+    host = urlparse(url).hostname or ""
+    pairs = []
+    for c in load_session().cookies:
+        dom = (c.domain or "").lstrip(".")
+        if host == dom or host.endswith("." + dom):
+            pairs.append(f"{c.name}={c.value}")
+    return "; ".join(pairs)
+
+
+if __name__ == "__main__":
+    import sys
+    url = sys.argv[1] if len(sys.argv) > 1 else "https://www.qianwenai.com/"
+    s = load_session()
+    r = s.get(url, timeout=20, allow_redirects=False)
+    print("status:", r.status_code)
+    print("redirect:", r.headers.get("location", "-"))
+    body = r.text
+    print("title:", body.split("<title>")[1].split("</title>")[0] if "<title>" in body else "-")
+    print("len:", len(body))
