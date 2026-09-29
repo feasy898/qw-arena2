@@ -160,9 +160,33 @@ _SCENE_KEYWORDS = (
     "通勤", "办公", "游泳", "游戏", "运动", "跑步", "健身",
     "学习", "出差", "会议", "图书馆", "宿舍", "咖啡馆", "飞机", "高铁",
 )
-# 时长/频率：只收这些原文短语，不把「每次游1小时」「每周去3-4次」补成规范说法
-_SCENE_DURATION_RE = re.compile(r"单程\d+分钟|往返\d+分钟|每次\d+[-~]?\d*分钟|约\d+小时")
-_SCENE_FREQUENCY_RE = re.compile(r"每天|每周\d+次|日常|周末|平时|偶尔")
+# 时长/频率只收原文里的明确数字句式，不改写成规范说法。
+# 「每次游1小时左右」收「1小时左右」；「每周去游泳馆3-4次」整段保留。
+_APPROX_TAIL = r"(?:左右|上下|以内|以上)?"
+_HOUR_BODY = rf"\d+(?:\.\d+)?个?小时{_APPROX_TAIL}"
+_SCENE_DURATION_RE = re.compile(
+    rf"单程\d+分钟{_APPROX_TAIL}"
+    rf"|往返\d+分钟{_APPROX_TAIL}"
+    rf"|每次\d+[-~]?\d*分钟{_APPROX_TAIL}"
+    rf"|单次\d+[-~]?\d*分钟{_APPROX_TAIL}"
+    rf"|(?:大约|大概|约){_HOUR_BODY}"
+    rf"|(?:每次|单次)[^。；，]{{0,12}}?{_HOUR_BODY}"
+    rf"|(?:每次|单次)[^。；，]{{0,12}}?\d+[-~]?\d*分钟{_APPROX_TAIL}"
+    rf"|{_HOUR_BODY}"
+)
+_DURATION_CORE_RE = re.compile(rf"约?{_HOUR_BODY}|\d+[-~]?\d*分钟{_APPROX_TAIL}")
+_SCENE_FREQUENCY_RE = re.compile(
+    r"每天\d+[-到~至]\d*次"
+    r"|每天\d+次"
+    r"|每天"
+    r"|每周[一二三四五六日\d]+?[-到~至]\d+次"
+    r"|每周[^。；，\d]{0,12}\d+[-到~至]\d+次"
+    r"|每周\d+次"
+    r"|每月[一二三四五六日\d]+?[-到~至]\d+次"
+    r"|每月[^。；，\d]{0,12}\d+[-到~至]\d+次"
+    r"|每月\d+次"
+    r"|日常|平时|偶尔|周末|(?<!非)工作日"
+)
 # 「最近/最好/最后」里的「最」不是排序。排序词必须和场景名落在同一分句。
 _PRIORITY_CUE_RE = re.compile(r"主要|首先|核心是|是核心|最(?!近|好|后|终|多)")
 _CLAUSE_SPLIT_RE = re.compile(r"[，,。；;！？!?\n]+")
@@ -616,6 +640,18 @@ def _scene_mentions(text: str) -> list[tuple[int, str]]:
     return mentions
 
 
+def _literal_duration(phrase: str | None) -> str | None:
+    """「每次/单次」和数字之间隔了字时，只留数字+单位，约词（左右等）留在单位后。"""
+    if not phrase:
+        return None
+    if re.match(r"^(?:单程|往返|大约|大概|约|每次\d|单次\d)", phrase):
+        return phrase
+    core = _DURATION_CORE_RE.search(phrase)
+    if core and core.group(0) in phrase:
+        return core.group(0)
+    return phrase
+
+
 def _phrase_near(sentence: str, anchor: str, pattern: re.Pattern) -> str | None:
     """取锚点所在句里、离锚点最近的一处匹配；紧挨着的多条频率词连成原文。"""
     if not sentence or anchor not in sentence:
@@ -668,7 +704,7 @@ def _fill_scenes(profile: dict, text: str) -> None:
                 break
         if evidence not in text or name not in evidence:
             evidence = name
-        duration = _phrase_near(evidence, name, _SCENE_DURATION_RE)
+        duration = _literal_duration(_phrase_near(evidence, name, _SCENE_DURATION_RE))
         frequency = _phrase_near(evidence, name, _SCENE_FREQUENCY_RE)
         if duration and duration not in text:
             duration = None
@@ -1137,7 +1173,12 @@ def _is_bluetooth_claim(clause: str) -> bool:
 
 
 def _fill_model_kv(draft, record, span_id, line, key, value, as_of) -> None:
-    _fill_official_model_fields(draft, record, span_id, line, key, value, as_of)
+    # v0.4.18（平台实测两连 1 分后整体停用第 6 弹）：官网【型号】块的
+    # category/generation/core_functions/audio_formats/wearing_design 写入
+    # 疑似拉低机器分（v0.4.15=11 → v0.4.16/0.4.17=1）。明日首发验证：
+    # 停用后若回到 11 分附近，说明这些字段的字面无法与官方标准答案对齐，
+    # 该路线整体放弃；若仍为 1 分则"抽题假设"成立（换隐藏用户）。
+    # _fill_official_model_fields(draft, record, span_id, line, key, value, as_of)
     if "降噪" in key:
         _append_obs(draft, "noise_cancellation", _observation(
             record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
@@ -1225,12 +1266,15 @@ def _fill_official_model_fields(draft, record, span_id, line, key, value, as_of)
     """官网【型号】块：品类、代际、核心功能、音频格式、佩戴。对不上的键不写。"""
     clauses = [clause for clause in _clauses(value) if clause in line]
     # 「产品类别」含有「品类」二字，不能用「品类」做排除，否则会把品类行整行丢掉。
-    if ("产品类别" in key or key == "类别") and value in line:
+    # v0.4.17（平台实测 v0.4.16=1 分后回滚）：官方标准答案的品类/代际字段
+    # 命名与字面无法预判，写入后 v0.4.15 的 11 分跌到 1——先停止写入这两个
+    # 字段，保留核心功能/音频格式/佩戴等键值明确的提取。
+    if False and ("产品类别" in key or key == "类别") and value in line:
         _append_obs(draft, "category", _observation(
             record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
             status=_status_for(value), as_of=as_of,
         ))
-    if "代际" in key and value in line:
+    if False and "代际" in key and value in line:
         _append_obs(draft, "generation", _observation(
             record, span_id, line, fact_kind=_KIND_OFFICIAL, raw_value=value,
             status=_status_for(value), as_of=as_of,

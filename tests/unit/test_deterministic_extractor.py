@@ -247,11 +247,148 @@ def test_purchase_goals_from_sample_users():
     assert user5["desired_product_type"] in text5
     assert any("音乐" in item for item in user5["purchase_purposes"])
     assert all(item in text5 for item in user5["purchase_purposes"])
-    # 「每周去游泳馆3-4次 / 每次游1小时」对不上指定短语，保持空
     swim = next(scene for scene in user5["scenes"] if scene["scene_name"] == "游泳")
-    assert swim["usage_duration"] is None
-    assert swim["usage_frequency"] is None
+    assert swim["usage_duration"] == "1小时左右"
+    assert swim["usage_frequency"] == "每周去游泳馆3-4次"
+    assert swim["usage_duration"] in text5
+    assert swim["usage_frequency"] in text5
     assert swim["priority_basis"] == "优先级未明确"
+
+
+def test_duration_frequency_keep_explicit_source_spans():
+    """只收明确数字句式；间隔动词不进时长，频率不改写成规范说法。"""
+    source = "每周去游泳馆3-4次，每次游1小时左右。游泳。"
+    swim = deterministic_profile(source)
+    scene = next(item for item in swim["scenes"] if item["scene_name"] == "游泳")
+    assert scene["usage_frequency"] == "每周去游泳馆3-4次"
+    assert scene["usage_duration"] == "1小时左右"
+    assert scene["usage_frequency"] in source and scene["usage_frequency"] in scene["scene_evidence"]
+    assert scene["usage_duration"] in source and scene["usage_duration"] in scene["scene_evidence"]
+
+    ranged = deterministic_profile("每周3-4次游泳。")
+    assert ranged["scenes"][0]["usage_frequency"] == "每周3-4次"
+    assert ranged["scenes"][0]["usage_duration"] is None
+
+    weekly = deterministic_profile("每周6次去游泳。")
+    assert weekly["scenes"][0]["usage_frequency"] == "每周6次"
+    tilde = deterministic_profile("每周3~4次游泳。")
+    assert tilde["scenes"][0]["usage_frequency"] == "每周3~4次"
+    weekday = deterministic_profile("每周一至3次游泳。")
+    assert weekday["scenes"][0]["usage_frequency"] == "每周一至3次"
+
+    monthly = deterministic_profile("每月2次游泳。")
+    assert monthly["scenes"][0]["usage_frequency"] == "每月2次"
+    monthly_range = deterministic_profile("每月1-2次游泳。")
+    assert monthly_range["scenes"][0]["usage_frequency"] == "每月1-2次"
+
+    workday = deterministic_profile("工作日通勤单程40分钟。")
+    commute = next(item for item in workday["scenes"] if item["scene_name"] == "通勤")
+    assert commute["usage_frequency"] == "工作日"
+    assert commute["usage_duration"] == "单程40分钟"
+    offday = deterministic_profile("非工作日通勤。")
+    assert next(item for item in offday["scenes"] if item["scene_name"] == "通勤")["usage_frequency"] is None
+
+    glued = deterministic_profile("每次1小时左右游泳。")
+    assert glued["scenes"][0]["usage_duration"] == "每次1小时左右"
+    single = deterministic_profile("单次30分钟游泳。")
+    assert single["scenes"][0]["usage_duration"] == "单次30分钟"
+    gap_minute = deterministic_profile("每次游30分钟左右游泳。")
+    assert next(item for item in gap_minute["scenes"] if item["scene_name"] == "游泳")["usage_duration"] == "30分钟左右"
+    approx = deterministic_profile("约2小时游泳。")
+    assert approx["scenes"][0]["usage_duration"] == "约2小时"
+    approx_tail = deterministic_profile("大约1个小时左右游泳。")
+    assert approx_tail["scenes"][0]["usage_duration"] == "大约1个小时左右"
+
+    legacy = deterministic_profile("每天地铁通勤单程40分钟。偶尔在咖啡馆办公。往返70分钟坐高铁。")
+    by_name = {item["scene_name"]: item for item in legacy["scenes"]}
+    assert by_name["通勤"]["usage_frequency"] == "每天"
+    assert by_name["通勤"]["usage_duration"] == "单程40分钟"
+    assert by_name["咖啡馆办公"]["usage_frequency"] == "偶尔"
+    assert by_name["咖啡馆办公"]["usage_duration"] is None
+    assert by_name["高铁"]["usage_duration"] == "往返70分钟"
+    # 「长时间」没有数字，不猜时长
+    game = deterministic_profile("能长时间打游戏。")
+    assert game["scenes"][0]["usage_duration"] is None
+    assert game["scenes"][0]["usage_frequency"] is None
+
+
+# 官方样例原文跑出来的场景时长/频率。U1–U4 作为回归基线，改句式不得改写它们。
+_SAMPLE_SCENE_BASELINE = {
+    1: [
+        ("通勤", "单程40分钟", "每天", None, "优先级未明确"),
+        ("咖啡馆办公", None, "平时周末", None, "优先级未明确"),
+    ],
+    2: [
+        ("宿舍", None, "平时", 1, "原文主次措辞"),
+        ("图书馆学习", None, "平时", 1, "原文主次措辞"),
+        ("跑步", None, "平时", None, "优先级未明确"),
+    ],
+    3: [
+        ("游戏", None, None, 1, "原文主次措辞"),
+    ],
+    4: [
+        ("出差", None, None, None, "优先级未明确"),
+        ("飞机", None, None, None, "优先级未明确"),
+        ("高铁", None, None, None, "优先级未明确"),
+        ("会议", None, None, None, "优先级未明确"),
+    ],
+}
+
+
+def test_sample_users_scene_duration_frequency():
+    """六个官方样例：U5/U6 游泳时长频率取原文子串；U1–U4 场景三要素不变。"""
+    bundle, _registry, _index = _load()
+    for number, expected in _SAMPLE_SCENE_BASELINE.items():
+        text = _user_text(bundle, number)
+        profile = deterministic_profile(text)
+        got = [
+            (
+                scene["scene_name"], scene["usage_duration"], scene["usage_frequency"],
+                scene["scene_priority"], scene["priority_basis"],
+            )
+            for scene in profile["scenes"]
+        ]
+        assert got == expected
+        for scene in profile["scenes"]:
+            assert scene["scene_name"] in text
+            if scene["usage_duration"] is not None:
+                assert scene["usage_duration"] in text
+                assert scene["usage_duration"] in scene["scene_evidence"]
+            if scene["usage_frequency"] is not None:
+                assert scene["usage_frequency"] in text
+                assert scene["usage_frequency"] in scene["scene_evidence"]
+
+    for number in (5, 6):
+        text = _user_text(bundle, number)
+        profile = deterministic_profile(text)
+        swim = next(scene for scene in profile["scenes"] if scene["scene_name"] == "游泳")
+        assert swim["usage_duration"] == "1小时左右"
+        assert swim["usage_frequency"] == "每周去游泳馆3-4次"
+        assert swim["usage_duration"] in text
+        assert swim["usage_frequency"] in text
+        assert swim["usage_duration"] in swim["scene_evidence"]
+        assert swim["usage_frequency"] in swim["scene_evidence"]
+        assert "3-4次" in swim["usage_frequency"]
+        assert "小时" in swim["usage_duration"] and "左右" in swim["usage_duration"]
+
+    user5 = deterministic_profile(_user_text(bundle, 5))
+    swim5 = next(scene for scene in user5["scenes"] if scene["scene_name"] == "游泳")
+    assert swim5["scene_priority"] is None
+    assert swim5["priority_basis"] == "优先级未明确"
+    assert [scene["scene_name"] for scene in user5["scenes"]] == ["游泳"]
+
+    user6 = deterministic_profile(_user_text(bundle, 6))
+    by_name = {scene["scene_name"]: scene for scene in user6["scenes"]}
+    assert [scene["scene_name"] for scene in user6["scenes"]] == ["游泳", "健身", "跑步"]
+    swim6 = by_name["游泳"]
+    assert swim6["scene_priority"] == 1
+    assert swim6["priority_basis"] == "原文主次措辞"
+    assert by_name["健身"]["usage_duration"] is None
+    assert by_name["健身"]["usage_frequency"] == "平时"
+    assert by_name["跑步"]["usage_duration"] is None
+    assert by_name["跑步"]["usage_frequency"] == "平时"
+    assert by_name["健身"]["usage_frequency"] in _user_text(bundle, 6)
+    assert by_name["跑步"]["usage_frequency"] in _user_text(bundle, 6)
 
 
 _CLOSED_SET_USERS = (
@@ -708,29 +845,16 @@ def test_official_model_block_fields_for_five_products():
         draft = drafts[canonical_id]
         category = _raw_values(draft["category"])
         generation = _raw_values(draft["generation"])
-        assert category == [spec["category"]], canonical_id
-        assert generation == [spec["generation"]], canonical_id
-        assert "2024" in generation[0] or canonical_id not in {"P001", "P003"}
-        assert _items(draft["core_functions"]) == spec["functions"], canonical_id
-        assert _items(draft["audio_formats"]) == spec["formats"], canonical_id
-        assert "MP3" in spec["formats"] or canonical_id == "P005"
-        assert _raw_values(draft["wearing_design"]) == spec["wearing"], canonical_id
-        if canonical_id == "P003":
-            assert "颈后式开放佩戴" in spec["wearing"][0]
-            assert "游泳耳塞" in spec["wearing"][0]
-        if canonical_id == "P004":
-            assert "使用游泳耳塞时可在淡水/海水约2米内30分钟" in _blob(draft["waterproof_conditions"])
-        assert draft["category"][0]["fact_kind"] == "官网声明"
-        assert draft["generation"][0]["fact_kind"] == "官网声明"
-        assert draft["core_functions"][0]["fact_kind"] == "官网声明"
-        assert draft["audio_formats"][0]["fact_kind"] == "官网声明"
-        assert all(obs["fact_kind"] == "官网声明" for obs in draft["wearing_design"])
+        # v0.4.18：第 6 弹整体停用（平台实测 v0.4.16/0.4.17 两连 1 分）
+        assert category == [], canonical_id
+        assert generation == [], canonical_id
+        assert _items(draft.get("core_functions", [])) == [], canonical_id
+        assert _items(draft.get("audio_formats", [])) == [], canonical_id
+        assert draft.get("wearing_design", []) == [], canonical_id
         # 品牌概况早先已抽取，这里只确认没有被这次补字段冲掉
         assert draft["brand_origin_market"]
         assert draft["brand_category_focus"]
         assert_evidence_refs_verbatim(draft, records[canonical_id])
-    assert drafts["P005"]["audio_formats"][0]["status"] == "附条件"
-    assert drafts["P001"]["audio_formats"][0]["status"] == "有支持"
 
 
 def test_p001_bluetooth_underwater_keeps_both_sides():
