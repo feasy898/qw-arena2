@@ -18,6 +18,7 @@ from src.input_adapter import load_input
 from src.model_gateway import GatewayError
 from src.schema_extractor import (
     PRODUCT_GROUNDED_PROMPT,
+    PRODUCT_SUPPRESSED_FIELDS,
     PROFILE_GROUNDED_PROMPT,
     STRUCTURE_MARKER,
     _validate_with_grounding,
@@ -244,12 +245,15 @@ def test_extract_product_grounded_full_chain(p001_records):
     assert draft["product_name"] == "Ralun Pro"
     assert draft["brand"] == "Zurmek"
     assert draft["aliases"] == ["P001", "P01"]  # registry 权威别名并集（P01≡P001）
+    # v0.5.1：官网【型号】块五字段停采——stub 输出里带着 category，
+    # 但 Schema 白名单不收录，校验层静默忽略后草稿落空列表
+    for key in ("category", "generation", "core_functions", "audio_formats",
+                "wearing_design"):
+        assert draft.get(key) == []
     # 观察被归一为旧草稿形态，evidence 由代码定位回 (source_id, span_id)
-    assert draft["category"][0]["raw_value"] == "骨传导游泳耳机"
-    ref = draft["category"][0]["evidence_refs"][0]
-    assert ref["exact_quote"].startswith("产品类别")
-    assert ref["source_id"].startswith("04_Brand_Official_Sites/")
     assert draft["battery_by_mode"][0]["applicable_variant"] == "蓝牙模式"
+    ref = draft["battery_by_mode"][0]["evidence_refs"][0]
+    assert ref["exact_quote"] and ref["source_id"] and "span_id" in ref
 
 
 def test_extract_product_grounded_drops_unanchored_observation(p001_records):
@@ -267,7 +271,7 @@ def test_extract_product_grounded_drops_unanchored_observation(p001_records):
     draft, rejected = extract_product_grounded(record, records, StubGateway([out]), {})
     assert draft["warranty"] == []          # 被拒观察整条丢弃
     assert any("warranty" in r for r in rejected)
-    assert draft["category"]                 # 其余字段不受影响
+    assert draft["battery_by_mode"]         # 其余字段不受影响
 
 
 def test_extract_product_grounded_identity_requires_verbatim_value(p001_records):
@@ -353,3 +357,13 @@ def test_prompts_require_wrapped_value_and_quote():
     for prompt in (profile_prompt, product_prompt):
         assert '"value"' in prompt and '"exact_quote"' in prompt
         assert "逐字" in prompt and "null" in prompt
+
+
+def test_official_model_fields_suppressed_everywhere():
+    """v0.5.1：官网【型号】块五字段在 Schema 与 Prompt 两层都停采（11 分形态对齐）。"""
+    schema = product_field_schema()["fields"]
+    for key in PRODUCT_SUPPRESSED_FIELDS:
+        assert key not in schema, f"停采集字段仍在 Schema 白名单: {key}"
+    product_prompt = (REPO_ROOT / PRODUCT_GROUNDED_PROMPT).read_text(encoding="utf-8")
+    for key in PRODUCT_SUPPRESSED_FIELDS:
+        assert f"`{key}`" not in product_prompt, f"产品 Prompt 字段目录仍含停采集键: {key}"

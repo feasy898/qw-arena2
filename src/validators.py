@@ -150,12 +150,21 @@ def _check_structured_items(
         return
     required_items = {item["key"]: item for item in item_fields if item.get("required")}
     known_items = {item["key"] for item in item_fields}
+    # 契约 missing="优先级未明确" 的两键：无法排序时写「优先级未明确」是官方
+    # value_rule 的合法表达（field_catalog scenes.item_fields），渲染回读还会把
+    # 该表达解析回 None。按缺失报 high 会让修复环无法收敛（原文无优先级依据
+    # 时不可伪造整数），v0.5.1 实测 6 用户 3 户因此修复环用尽。对齐契约：豁免
+    # ITEM_REQUIRED，枚举/类型检查保留。
+    soft_missing_items = {key for key, item_def in required_items.items()
+                          if item_def.get("missing") == "优先级未明确"}
     for index, item in enumerate(value, start=1):
         for key in item:
             if key not in known_items:
                 issues.append(_issue(f"{code_prefix}_UNKNOWN_KEY", "medium",
                                      f"{list_key}[{index}] 未知项字段：{key}"))
         for key, item_def in required_items.items():
+            if key in soft_missing_items:
+                continue
             sub = item.get(key)
             if sub is None or (isinstance(sub, str) and _is_missing_text(sub)):
                 issues.append(
@@ -163,7 +172,8 @@ def _check_structured_items(
                            f"{list_key}[{index}].{key}（{item_def['name'].format(n=index)}）缺失")
                 )
         priority = item.get("scene_priority") if "scene_priority" in item else None
-        if "scene_priority" in item and priority is not None and (isinstance(priority, bool) or not isinstance(priority, int)):
+        if (priority is not None and str(priority) != "优先级未明确"
+                and (isinstance(priority, bool) or not isinstance(priority, int))):
             issues.append(_issue(f"{code_prefix}_TYPE", "high",
                                  f"{list_key}[{index}].scene_priority 应为整数，实为 {priority!r}"))
         basis = item.get("priority_basis")

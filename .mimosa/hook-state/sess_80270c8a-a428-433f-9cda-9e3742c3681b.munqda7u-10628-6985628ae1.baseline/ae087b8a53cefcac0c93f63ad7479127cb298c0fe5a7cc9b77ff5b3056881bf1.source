@@ -135,12 +135,24 @@ def profile_field_schema() -> dict:
     return {"fields": fields}
 
 
+# v0.5.1：官网【型号】块五字段整体停采（与 v0.4.15=11 分形态对齐）。
+# 平台实测：写这些字段的字面无法与官方标准答案逐字对齐，且疑似触发证据
+# 纪律扣分（v0.4.16 官网全字段=1、v0.4.17 保留三项=1；不写的 v0.4.15=11）。
+# Schema 白名单剔除后，模型即使输出这些键也会被校验层静默忽略。
+PRODUCT_SUPPRESSED_FIELDS = frozenset({
+    "category", "generation", "core_functions", "audio_formats", "wearing_design",
+})
+
+
 def product_field_schema() -> dict:
-    """产品 grounded 输出的字段 Schema（36 个观察字段键与 product_extractor 同源）。"""
+    """产品 grounded 输出的字段 Schema（观察字段键与 product_extractor 同源，
+    减去 PRODUCT_SUPPRESSED_FIELDS 停采集）。"""
     fields: dict = {key: {"type": "scalar", "grounded": True}
                     for key in PRODUCT_IDENTITY_KEYS}
     fields["aliases"] = {"type": "list", "grounded": False}
     for key in product_extractor._field_keys():
+        if key in PRODUCT_SUPPRESSED_FIELDS:
+            continue
         # 身份五键（canonical_id/aliases/product_name/brand/model）不是观察数组：
         # 前两者由代码确定性填充，后三者在顶层按标量登记，禁止被观察规格覆盖
         if key in ("aliases", "canonical_id") or key in PRODUCT_IDENTITY_KEYS:
