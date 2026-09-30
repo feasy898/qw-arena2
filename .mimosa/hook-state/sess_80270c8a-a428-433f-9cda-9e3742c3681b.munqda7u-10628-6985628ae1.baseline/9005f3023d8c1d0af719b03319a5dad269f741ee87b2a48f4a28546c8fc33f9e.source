@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 AGENT_SOURCE = REPO_ROOT / "agent" / "agent.py"
 AGENT_JSON = REPO_ROOT / "agent" / "agent.json"
 
-EXPECTED_VERSION = "0.5.0"
+EXPECTED_VERSION = "0.5.1"
 OUTPUT_NAMES = ("user_profile.md", "product_list.md", "recommendation.md")
 SUBPROCESS_TIMEOUT_SECONDS = 300  # 真实 src 导入链秒级；超时即视为失败（不掩盖）
 

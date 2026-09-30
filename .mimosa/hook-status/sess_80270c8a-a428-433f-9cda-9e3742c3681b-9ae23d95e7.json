@@ -1,14 +1,14 @@
 {
   "schemaVersion": "mimosa-hook-status/v1",
-  "recordedAt": "2026-09-29T15:47:32.243Z",
+  "recordedAt": "2026-09-30T05:17:30.989Z",
   "sessionId": "sess_80270c8a-a428-433f-9cda-9e3742c3681b",
   "event": "PostToolUse",
   "toolName": "Edit",
-  "file": "src/pipeline.py",
+  "file": "tests/unit/test_agent_phoenix.py",
   "outcome": "clear",
   "coverage": "complete",
   "findingCount": 0,
-  "durationMs": 171,
+  "durationMs": 129,
   "hostState": "hook_complete",
   "reportHint": ".mimosa/reports/"
 }

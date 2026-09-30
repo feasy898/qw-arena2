@@ -115,10 +115,12 @@ def test_grounded_chain_subprocess(tmp_path):
 def test_missing_grounded_keys_falls_back_to_deterministic(tmp_path):
     """夹具缺 grounded 键 → MockResponseMissingError → 既有确定性降级链接管。
 
-    既有不变量（v0.4.x，非本架构引入）：确定性降级链存在场景优先级类 OBJ high
-    （scene_priority 资料确无时如实缺失），修复环耗尽后 run() raise ValueError、
-    CLI 层经 phoenix 防线转退出码 0；本测试锁定「降级接管 + 产物仍落盘 + 不走
-    grounded 主路径」这三个要点。
+    v0.5.1 行为更新（契约对齐修复，原 v0.4.x 不变量已按 field_catalog 修正）：
+    场景 scene_priority 资料确无时，契约 value_rule 明示「无法排序时写
+    『优先级未明确』」（missing=优先级未明确），旧 validators 把该缺失表达判
+    high 导致修复环必耗尽 raise——已被判定为与契约冲突的实现缺陷而非不变量。
+    现期望：降级链正常完成（不 raise），三份产物落盘且场景优先级行渲染为
+    「优先级未明确」，不走 grounded 主路径。
     """
     fixture_path = tmp_path / "legacy_responses.json"
     legacy = json.loads(SHARED_FIXTURE.read_text(encoding="utf-8"))
@@ -128,10 +130,12 @@ def test_missing_grounded_keys_falls_back_to_deterministic(tmp_path):
     output_dir = tmp_path / "output"
     LAST_GROUNDING_MANIFEST.clear()
     try:
-        with pytest.raises(ValueError):
-            run(input_dir, output_dir, _mock_config(fixture_path))
+        bundle = run(input_dir, output_dir, _mock_config(fixture_path))
+        assert bundle is not None
         assert not LAST_GROUNDING_MANIFEST.get("products"), "不应走 grounded 主路径"
-        assert (output_dir / "user_profile.md").is_file()
+        profile_md = (output_dir / "user_profile.md").read_text(encoding="utf-8")
+        assert "优先级未明确" in profile_md
         assert (output_dir / "product_list.md").is_file()
+        assert (output_dir / "recommendation.md").is_file()
     finally:
         LAST_GROUNDING_MANIFEST.clear()
