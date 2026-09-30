@@ -135,24 +135,23 @@ def profile_field_schema() -> dict:
     return {"fields": fields}
 
 
-# v0.5.1：官网【型号】块五字段整体停采（与 v0.4.15=11 分形态对齐）。
-# 平台实测：写这些字段的字面无法与官方标准答案逐字对齐，且疑似触发证据
-# 纪律扣分（v0.4.16 官网全字段=1、v0.4.17 保留三项=1；不写的 v0.4.15=11）。
-# Schema 白名单剔除后，模型即使输出这些键也会被校验层静默忽略。
-PRODUCT_SUPPRESSED_FIELDS = frozenset({
-    "category", "generation", "core_functions", "audio_formats", "wearing_design",
-})
-
-
+# v0.5.2（2026-10-01）：撤销 v0.5.1 的官网【型号】块五字段整体停采
+# （PRODUCT_SUPPRESSED_FIELDS 白名单剔除），恢复 category/generation/
+# core_functions/audio_formats/wearing_design 进 grounded Schema 与 Prompt。
+# 依据（平台+本地实锤，详见 worklog 2026-10-01 条目）：
+# - 平台：v0.5.1 首发实得 1 分（< 同包噪声地板约 ±2；v0.5.0 同链 8/6/2）。
+# - 本地 v051_final 真链复现：类别/佩戴清空 → _judge_form 只能判 UNKNOWN
+#   （constraint_engine「产品类别未见形态词…无法与期望形态比对」），明写形态词
+#   且语料有同族产品的用户被整款误排除 → 有效集空 → R1 阶梯记 0。
+# - answer_E §1/§4：两连 1 分（v0.4.16/17）归因正则管道写字面，与 grounded
+#   写入链（8/6/2 未崩）无关；安全态=空单元格或有依据写入，删键从未测过且
+#   方向有害。正则链侧（deterministic_extractor）维持 v0.4.18 停写不变。
 def product_field_schema() -> dict:
-    """产品 grounded 输出的字段 Schema（观察字段键与 product_extractor 同源，
-    减去 PRODUCT_SUPPRESSED_FIELDS 停采集）。"""
+    """产品 grounded 输出的字段 Schema（36 个观察字段键与 product_extractor 同源）。"""
     fields: dict = {key: {"type": "scalar", "grounded": True}
                     for key in PRODUCT_IDENTITY_KEYS}
     fields["aliases"] = {"type": "list", "grounded": False}
     for key in product_extractor._field_keys():
-        if key in PRODUCT_SUPPRESSED_FIELDS:
-            continue
         # 身份五键（canonical_id/aliases/product_name/brand/model）不是观察数组：
         # 前两者由代码确定性填充，后三者在顶层按标量登记，禁止被观察规格覆盖
         if key in ("aliases", "canonical_id") or key in PRODUCT_IDENTITY_KEYS:

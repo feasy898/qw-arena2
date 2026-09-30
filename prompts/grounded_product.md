@@ -37,6 +37,22 @@
   "brand": {"value": "虚构品牌甲", "exact_quote": "含品牌名的原文连续片段"},
   "model": {"value": "示例型号 Alpha", "exact_quote": "含型号的原文连续片段"},
   "aliases": {"value": ["P007"], "exact_quote": null},
+  "category": {
+    "value": [
+      {
+        "raw_value": "示例品类描述（原样摘抄）",
+        "normalized_value": null,
+        "unit": null,
+        "fact_kind": "官网声明",
+        "status": "有支持",
+        "conditions": [],
+        "applicable_variant": null,
+        "as_of": "2026-01-15",
+        "exact_quote": "产品类别：示例品类描述"
+      }
+    ],
+    "exact_quote": null
+  },
   "battery_by_mode": {
     "value": [
       {
@@ -60,18 +76,16 @@
 
 - 普通字段与列表型字段的 `value` 都是**观察数组**；观察键固定为：
   `raw_value`（原文写法，含「约/最长」限定词）、`normalized_value`（数值化结果，无法数值化填 `null`）、`unit`、`fact_kind`、`status`、`conditions`（字符串数组）、`applicable_variant`（适用变体/模式，无则 `null`）、`as_of`、`exact_quote`（该条观察的逐字证据）。
-- 列表型字段（`variants`、`accessories_fit`、`special_features`、`marketing_claims`、`common_praise`、`common_complaints`）：观察用 `items`（字符串数组）代替 `raw_value`/`normalized_value`/`unit`，其余键相同；`items` 每项都应能在该条 `exact_quote` 指向的原文里逐字找到。
+- 列表型字段（`core_functions`、`audio_formats`、`variants`、`accessories_fit`、`special_features`、`marketing_claims`、`common_praise`、`common_complaints`）：观察用 `items`（字符串数组）代替 `raw_value`/`normalized_value`/`unit`，其余键相同；`items` 每项都应能在该条 `exact_quote` 指向的原文里逐字找到。
 - `battery_by_mode`：续航按模式拆成多条观察，`applicable_variant` 填模式名（`蓝牙模式`/`MP3模式`/`内存模式`/`本地MP3`/`未区分模式`…），`raw_value` 填该模式时长（保留「最长/约」），禁止合并模式、禁止取平均。
 - 字段级 `exact_quote`：程序不校验它（观察级 `exact_quote` 才是证据锚点），无把握时填 `null` 即可。
 - `aliases`：资料中出现的该产品全部编号写法（普通字符串数组）；程序会与登记别名并集校对，`exact_quote` 填 `null`。
 
-### 全部字段键（31 个，全部必须出现）
+### 全部字段键（36 个，全部必须出现）
 
-基础标识：`aliases`、`variants`（颜色/套餐，货架快照列；该列**为空时必须给 `[]`**，严禁把型号名或其他列的值填充进来）、`channel_and_shop`（平台+店铺类型）、`listing_title`（货架商品标题原样）。
+基础标识：`aliases`、`category`、`core_functions`、`generation`、`variants`（颜色/套餐，货架快照列；该列**为空时必须给 `[]`**，严禁把型号名或其他列的值填充进来）、`channel_and_shop`（平台+店铺类型）、`listing_title`（货架商品标题原样）。
 
-产品力：`noise_cancellation`（区分「无主动降噪」与「环境降噪/环境声模式」）、`call_capability`、`acoustic_tech`、`local_storage_gb`（normalized_value 填 GB 数值）、`bluetooth`（支持与否+版本；版本仅见渠道宣称时按宣传表述处理并在 conditions 注明）、`bluetooth_underwater`（水下能否用蓝牙；渠道宣称与第三方实测各记一条，由程序按冲突三步法归并）、`battery_by_mode`、`charging`、`weight_g`（normalized_value 填 g 数值）、`protection_rating`（如防护等级代码原样）、`waterproof_conditions`（水深/时长/水质/耳塞条件逐条；不以防护等级自行外推）、`accessories_fit`、`special_features`。
-
-> 产品类别、产品代际、核心功能、音频格式、佩戴方式五项**不在字段目录内**：即使资料中有官网【型号】块的对应表述，也不要为它们输出任何键或观察（输出也会被程序丢弃）。
+产品力：`noise_cancellation`（区分「无主动降噪」与「环境降噪/环境声模式」）、`call_capability`、`acoustic_tech`、`local_storage_gb`（normalized_value 填 GB 数值）、`audio_formats`、`bluetooth`（支持与否+版本；版本仅见渠道宣称时按宣传表述处理并在 conditions 注明）、`bluetooth_underwater`（水下能否用蓝牙；渠道宣称与第三方实测各记一条，由程序按冲突三步法归并）、`battery_by_mode`、`charging`、`wearing_design`、`weight_g`（normalized_value 填 g 数值）、`protection_rating`（如防护等级代码原样）、`waterproof_conditions`（水深/时长/水质/耳塞条件逐条；不以防护等级自行外推）、`accessories_fit`、`special_features`。
 
 品牌力：`brand_origin_market`（官网品牌概况的归属与市场）、`brand_category_focus`（品类积累）、`brand_reputation`（名气口碑；仅见宣传性表述时按铁律 4 记待核验型观察，原文同时登记进 `marketing_claims`）。
 

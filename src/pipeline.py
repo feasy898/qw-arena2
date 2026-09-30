@@ -79,7 +79,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -675,18 +675,12 @@ def _run_core(input_dir: PathLike, output_dir: PathLike, config: dict,
         raise ValueError(
             f"修复循环用尽（{attempts} 轮）仍有 {len(highs)} 项 high 级校验未通过：\n{detail}")
     assert bundle is not None
-    if degrade_template:
-        # v0.4.11（grok 第二意见）：降级现场写进产物顶部 HTML 注释（不含密钥），
-        # 平台侧任何人工/日志回看通道都能定位到具体异常类型与网关主机
-        try:
-            diag = ("<!-- degrade: model-path unavailable; "
-                    f"gateway={getattr(gateway, '_base_url', None) or 'n/a'}; "
-                    f"elapsed={budget.elapsed_seconds():.0f}s; "
-                    f"mock={gateway.mock_mode if gateway is not None else 'gw-none'} -->\n")
-            bundle = OutputBundle(diag + bundle.user_profile_md,
-                                  bundle.product_list_md, bundle.recommendation_md)
-        except Exception:
-            pass
+    # v0.5.2（2026-10-01）：撤销 v0.4.11 引入、降级时往 user_profile.md 顶部写
+    # 「<!-- degrade: … -->」HTML 注释的诊断特性（v0.4.13 曾删除，v0.4.15 重构
+    # 误带回）。平台实锤该注释破坏 E10 结构：v0.4.12 携带时平台 Score=2
+    # （submission_log 行21「注释bug实锤」），v0.4.13 删除后本地 evaluate 归零
+    # （行22）；worker-B badcase_degrade_comment_e10 夹具同轴锁定。诊断信息
+    # 仍走 AGENT_LOG_DIR 日志通道，不入评分产物。
     logger.info("运行完成 耗时=%.2fs token≈%d 输出=%s",
                 budget.elapsed_seconds(), budget.total_tokens,
                 [Path(p).name for p in write_outputs(bundle, output_dir)])

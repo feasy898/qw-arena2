@@ -18,7 +18,6 @@ from src.input_adapter import load_input
 from src.model_gateway import GatewayError
 from src.schema_extractor import (
     PRODUCT_GROUNDED_PROMPT,
-    PRODUCT_SUPPRESSED_FIELDS,
     PROFILE_GROUNDED_PROMPT,
     STRUCTURE_MARKER,
     _validate_with_grounding,
@@ -245,10 +244,14 @@ def test_extract_product_grounded_full_chain(p001_records):
     assert draft["product_name"] == "Ralun Pro"
     assert draft["brand"] == "Zurmek"
     assert draft["aliases"] == ["P001", "P01"]  # registry 权威别名并集（P01≡P001）
-    # v0.5.1：官网【型号】块五字段停采——stub 输出里带着 category，
-    # 但 Schema 白名单不收录，校验层静默忽略后草稿落空列表
-    for key in ("category", "generation", "core_functions", "audio_formats",
-                "wearing_design"):
+    # v0.5.2：官网【型号】块五字段恢复采集——stub 输出里的 category 观察
+    # 应通过 Schema 校验落入草稿（v0.5.1 停采断言的反向；恢复依据见
+    # test_official_model_fields_restored_everywhere 注记）
+    cat_obs = draft["category"]
+    assert len(cat_obs) == 1
+    assert cat_obs[0]["raw_value"] == "骨传导游泳耳机"
+    assert cat_obs[0]["evidence_refs"][0]["exact_quote"] == _p001_source_quote(records, "产品类别")
+    for key in ("generation", "core_functions", "audio_formats", "wearing_design"):
         assert draft.get(key) == []
     # 观察被归一为旧草稿形态，evidence 由代码定位回 (source_id, span_id)
     assert draft["battery_by_mode"][0]["applicable_variant"] == "蓝牙模式"
@@ -359,11 +362,25 @@ def test_prompts_require_wrapped_value_and_quote():
         assert "逐字" in prompt and "null" in prompt
 
 
-def test_official_model_fields_suppressed_everywhere():
-    """v0.5.1：官网【型号】块五字段在 Schema 与 Prompt 两层都停采（11 分形态对齐）。"""
+#: v0.5.2 恢复采集的官网【型号】块五字段（v0.5.1 PRODUCT_SUPPRESSED_FIELDS 回滚）
+OFFICIAL_MODEL_FIELDS = (
+    "category", "generation", "core_functions", "audio_formats", "wearing_design",
+)
+
+
+def test_official_model_fields_restored_everywhere():
+    """v0.5.2：官网【型号】块五字段恢复进 Schema 与 Prompt 两层（停采回滚）。
+
+    依据：v0.5.1 停采实锤有害——v051_final 真链 6 用户复现：类别/佩戴清空后
+    constraint_engine._judge_form 只能判 UNKNOWN（constraint_engine.py「产品类别
+    未见形态词…无法与期望形态比对」），凡明写形态词且语料有同族产品的用户
+    （如骨传导）被整款误排除，有效集空 → R1 阶梯记 0（平台 v0.5.1 首发 1 分）。
+    answer_E §1/§4：安全态=空单元格或有依据写入；正则版两连 1 分归因正则管道
+    （v0.4.16/17），与 grounded 写入链（8/6/2，未崩）无关，删键方向撤回。
+    """
     schema = product_field_schema()["fields"]
-    for key in PRODUCT_SUPPRESSED_FIELDS:
-        assert key not in schema, f"停采集字段仍在 Schema 白名单: {key}"
+    for key in OFFICIAL_MODEL_FIELDS:
+        assert key in schema, f"恢复采集字段不在 Schema 白名单: {key}"
     product_prompt = (REPO_ROOT / PRODUCT_GROUNDED_PROMPT).read_text(encoding="utf-8")
-    for key in PRODUCT_SUPPRESSED_FIELDS:
-        assert f"`{key}`" not in product_prompt, f"产品 Prompt 字段目录仍含停采集键: {key}"
+    for key in OFFICIAL_MODEL_FIELDS:
+        assert f"`{key}`" in product_prompt, f"产品 Prompt 字段目录缺少恢复键: {key}"
