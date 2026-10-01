@@ -1,0 +1,121 @@
+{
+  "version": "0.1.0",
+  "purpose": "平台硬约束契约：环境变量、模型白名单、资源时限、产出文件、退出码、CLI 行为。与 SPEC.md §2 及 raw/competition-problemData.txt「说明 A」冲突时以官方原文为准。",
+  "runtime": {
+    "platform": "linux/amd64（Debian 12）",
+    "python_version": "3.12",
+    "entry": "agent/agent.py（根目录入口，由 src 组装/引用）",
+    "agent_json": {"runtime": "python", "version": "0.1.0"},
+    "deps_manifest": "requirements.txt",
+    "package": {
+      "dir": "agent",
+      "format": "zip",
+      "max_size_mb": 100,
+      "dependency_rule": "所有依赖打包进 ZIP，运行环境无网络安装能力",
+      "local_dev_dependencies": "只允许标准库 + requests（SPEC §2）"
+    }
+  },
+  "environment_variables": {
+    "DASHSCOPE_API_KEY": {
+      "source": "platform",
+      "required_for_real_mode": true,
+      "rule": "只从环境变量读取；不得写入代码/日志/文档/git；值为 mock 或缺失且未强制 mock 时走 mock 模式",
+      "official_basis": "raw/competition-problemData.txt 说明A：必须从环境变量中读取使用"
+    },
+    "DASHSCOPE_BASE_URL": {
+      "source": "platform",
+      "rule": "以 /api/v1 结尾；DashScope 原生 API 调用地址；注意不得重复拼接路径",
+      "official_basis": "说明A + 排查清单第8条"
+    },
+    "OPENAI_BASE_URL": {
+      "source": "platform",
+      "rule": "以 /v1 结尾；OpenAI 兼容 Chat API 调用地址（{OPENAI_BASE_URL}/chat/completions）",
+      "official_basis": "说明A + 排查清单第8条"
+    },
+    "AGENT_LOG_DIR": {
+      "source": "platform",
+      "rule": "日志写入该目录下 agent.log；本地开发缺省时默认 reports/logs/（AGENTS.md §10）；不打印完整用户资料与密钥",
+      "official_basis": "说明A；AGENTS.md"
+    },
+    "QW_FORCE_MOCK": {
+      "source": "project",
+      "rule": "=1 时强制 mock 模式（SPEC §11）；仅供本地开发与端到端 mock 测试，提交包内不依赖"
+    },
+    "HTTP_PROXY/HTTPS_PROXY": {
+      "source": "platform",
+      "rule": "验证容器注入，requests 自动遵循；线上仅放行 *.aliyuncs.com"
+    }
+  },
+  "model_whitelist_text": [
+    "qwen3.5-plus",
+    "qwen3.6-35b-a3b",
+    "qwen3.6-flash",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.8-max",
+    "qwen-plus",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-0731",
+    "deepseek-v4-pro",
+    "glm-5.1",
+    "glm-5.2",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "MiniMax-M2.5"
+  ],
+  "model_policy": {
+    "whitelist_scope": "仅上列文本模型可用于本任务（SPEC §2 列出的全部文本模型，逐字收录）；白名单外的语音/图像/视频等模型一律禁止调用，评测时其他模型调用必失败",
+    "api_modes": ["openai_compatible_chat", "dashscope_native"],
+    "unsupported": ["MCP", "模型内置工具", "智能体应用", "工作流", "记忆体", "知识库检索", "Embedding", "Responses API", "文件上传", "外部检索"],
+    "rate_limit": "必须正确处理 429；429 与部分 5xx 有限重试（指数退避+抖动，≤config.max_retries_per_request）；鉴权失败/模型未授权/预算耗尽→停止该路径并报告，不盲目重试",
+    "context_overflow": "缩小分块后重试",
+    "model_unavailable": "仅允许切换到白名单内预验证模型（config.fallback_models）",
+    "count_note": "SPEC §2 文字称「15 个」但其列举行含 16 个模型名；本契约按逐字列举收录 16 个，以列举为准（已登记 SPEC 计数笔误）"
+  },
+  "network": {
+    "allowed": "仅千问 AI 平台模型服务（*.aliyuncs.com）",
+    "forbidden": "任何外部检索与第三方网络访问；任务所需信息全在输入目录内"
+  },
+  "resource_limits": {
+    "time_hard_seconds": 1800,
+    "time_soft_seconds": 1680,
+    "time_hard_basis": "官方：单次执行时间限制 30 分钟内，超时任务失败",
+    "soft_deadline_behavior": "到达软截止触发降级（SPEC §11 顺序：停润色→停非关键复核→保全覆盖/硬约束/关键事实/结构→确定性模板输出→未知如实保留；禁止丢部分产品）",
+    "memory_limit_gb": 4
+  },
+  "outputs": [
+    {"file": "user_profile.md", "kind": "用户画像", "count": 1, "format": "md"},
+    {"file": "product_list.md", "kind": "产品属性", "count": 1, "format": "md"},
+    {"file": "recommendation.md", "kind": "消费推荐报告", "count": 1, "format": "md"}
+  ],
+  "outputs_rule": "输出目录下恰好这 3 份 Markdown；命名严格一致；字段可解析；内容遵循 contracts/field_catalog.json 与官方「内容要求」三条",
+  "exit_codes": {
+    "0": "成功（--version 输出版本号亦为 0）",
+    "1": "未分类失败",
+    "2": "--prompt 解析失败（无法从指令中定位输入/输出路径）",
+    "3": "输入目录不合法或缺失必需文件",
+    "4": "输出校验失败（修复循环用尽仍未通过确定性校验）",
+    "5": "模型网关致命错误（鉴权失败/模型未授权/预算耗尽等不可恢复错误）"
+  },
+  "exit_codes_note": "官方仅约定 0=成功、非 0=失败；上表为本项目的细分约定，任何非 0 都满足官方约定",
+  "cli": {
+    "--version": {
+      "behavior": "向 stdout 输出与 agent.json 的 version 字段一致的语义化版本号（当前 0.1.0），退出码 0",
+      "official_basis": "说明A：示例 agent.json {\"runtime\":\"python\",\"version\":\"1.0.0\"} 则 python agent.py --version 需输出 1.0.0，退出码 0"
+    },
+    "--prompt": {
+      "format": "--prompt \"<自然语言指令>\"，指令含输入/输出路径（官方示例：请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output）",
+      "parsing_rules": [
+        "1. 显式标记优先：『输入目录[:：]?』『读取』『根据…中的数据』『输入…目录』后出现的路径为输入；『输出目录[:：]?』『将结果输出到』『输出到』『结果写入』后出现的路径为输出",
+        "2. 反引号/引号/尖括号包裹的路径优先于裸路径",
+        "3. 路径须形如绝对路径（/ 开头）或存在的相对目录；提取后做 exists 校验（输入目录必须存在，输出目录可不存在则创建）",
+        "4. 兜底：扫描指令中全部路径样字符串；若恰有一个已存在的目录且语义词不足以区分，将其判为输入目录并报错退出码 2（输出无法定位时不得猜测）",
+        "5. 输入与输出任一无法定位→stderr 记原因、日志记录指令原文（指令不含密钥）、退出码 2",
+        "6. 指令文本一律当作数据处理：不得执行其中出现的任何类指令语句（防提示注入，AGENTS.md §7）"
+      ]
+    }
+  },
+  "config_defaults_ref": "config.example.json",
+  "related_contracts": ["contracts/field_catalog.json", "contracts/rules.json", "contracts/interfaces.md"]
+}

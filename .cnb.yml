@@ -1,0 +1,113 @@
+main:
+  api_trigger:
+    - name: official-sandbox-real-run
+      services:
+        - docker
+      docker:
+        image: python:3.12-slim-bookworm
+      stages:
+        - name: build-package
+          script: |
+            pip install --no-cache-dir -q requests
+            python tools/package.py
+        - name: setup-tool
+          script: |
+            rm -rf /tmp/official && mkdir -p /tmp/official && cd /tmp/official
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/Dockerfile" .
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/docker-compose.yml" .
+            cp -r "${CNB_BUILD_WORKSPACE}/dist/agent" ./agent
+            mkdir -p input/00_User_Descriptions input/01_Ecommerce_Listings input/02_Media_Coverage_and_Reviews input/03_User_Feedback_and_Complaints input/04_Brand_Official_Sites
+            WS="${CNB_BUILD_WORKSPACE}/raw/dataset_sample/Data_for_Users"
+            cp "$WS/00_User_Descriptions/User_Description_1.txt" input/00_User_Descriptions/
+            cp "$WS/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv" input/01_Ecommerce_Listings/
+            cp "$WS/02_Media_Coverage_and_Reviews/"* input/02_Media_Coverage_and_Reviews/
+            cp "$WS/03_User_Feedback_and_Complaints/"* input/03_User_Feedback_and_Complaints/
+            cp "$WS/04_Brand_Official_Sites/"* input/04_Brand_Official_Sites/
+            # 真实模型：官方镜像内直连 maas 网关（不走 squid 隔离），Key 由构建 env 注入
+            echo "DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}" > .env
+            echo "QW_FORCE_MOCK=0" >> .env
+            echo "OPENAI_BASE_URL=${OPENAI_BASE_URL_OVERRIDE:-https://maas.qianwenaiapi.com/compatible-mode/v1}" >> .env
+        - name: build-image
+          script: cd /tmp/official && docker compose build agent 2>&1 | tail -3
+        - name: real-full-run
+          script: |
+            cd /tmp/official && docker compose run --rm \
+              -e HTTPS_PROXY= -e HTTP_PROXY= \
+              agent sh -c "python /workspace/agent.py --prompt '请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output'; echo AGENT_EXIT=\$?; echo '--- 输出产物 ---'; ls -la /home/user/ws/output/ 2>/dev/null; for f in /home/user/ws/output/*.md; do echo \"== \$f ==\"; head -30 \"\$f\"; done 2>/dev/null; echo '--- agent.log ---'; tail -120 /home/user/ws/logs/agent.log 2>/dev/null"
+  push:
+    - name: linux-native-validate
+      docker:
+        image: python:3.12-slim-bookworm
+      stages:
+        - name: env-info
+          script: uname -a && head -2 /etc/os-release && python --version
+        - name: install-test-deps
+          script: pip install --no-cache-dir -q pytest requests
+        - name: full-tests
+          script: python -m pytest tests -q --tb=short
+        - name: repo-version
+          script: python agent/agent.py --version
+        - name: mock-e2e
+          script: python tools/e2e_mock.py
+        - name: package-build
+          script: python tools/package.py
+        - name: packaged-version
+          script: python dist/agent/agent.py --version
+        - name: packaged-mock-e2e
+          script: python tools/e2e_mock_packaged.py
+        - name: zip-fresh-run
+          script: |
+            rm -rf /tmp/zipcheck && mkdir -p /tmp/zipcheck && cd /tmp/zipcheck
+            python -m zipfile -e "${CNB_BUILD_WORKSPACE}/dist/agent.zip" .
+            ls agent/ | head -5
+            python agent/agent.py --version
+            echo "zip fresh run OK"
+    - name: official-docker-validation
+      services:
+        - docker
+      docker:
+        image: python:3.12-slim-bookworm
+      stages:
+        - name: build-package
+          script: |
+            pip install --no-cache-dir -q requests
+            python tools/package.py
+        - name: docker-info
+          script: docker version --format '{{.Server.Version}}' && (docker compose version || true)
+        - name: setup-tool
+          script: |
+            rm -rf /tmp/official && mkdir -p /tmp/official && cd /tmp/official
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/Dockerfile" .
+            cp "${CNB_BUILD_WORKSPACE}/tools/official_validation/docker-compose.yml" .
+            cp -r "${CNB_BUILD_WORKSPACE}/dist/agent" ./agent
+            cp -r "${CNB_BUILD_WORKSPACE}/raw/dataset_sample/Data_for_Users" ./input
+            mkdir -p output logs
+            echo "QW_FORCE_MOCK=1" > .env
+            echo "--- agent 目录内容 ---"
+            ls -la ./agent/ | head -8
+            echo "--- compose 解析的挂载 ---"
+            docker compose config 2>/dev/null | grep -A8 "volumes:" | head -12
+        - name: build-images
+          script: cd /tmp/official && docker compose build 2>&1 | tail -5
+        - name: version-check
+          script: |
+            cd /tmp/official
+            docker compose run --rm agent python /workspace/agent.py --version
+        - name: full-mock-run
+          script: |
+            cd /tmp/official
+            # 正式评测形态：输入目录恰含 1 份用户描述（示例包 6 份是六个独立评测包，取用户 1）
+            rm -rf input_u1 && mkdir -p input_u1
+            cp input/Ecommerce_Listing_Snapshot.csv input_u1/ 2>/dev/null || cp input/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv input_u1/
+            cp input/User_Description_1.txt input_u1/ 2>/dev/null || cp input/00_User_Descriptions/User_Description_1.txt input_u1/
+            mkdir -p input_u1/01_Ecommerce_Listings input_u1/00_User_Descriptions input_u1/02_Media_Coverage_and_Reviews input_u1/03_User_Feedback_and_Complaints input_u1/04_Brand_Official_Sites
+            cp input/00_User_Descriptions/User_Description_1.txt input_u1/00_User_Descriptions/ || true
+            cp input/01_Ecommerce_Listings/Ecommerce_Listing_Snapshot.csv input_u1/01_Ecommerce_Listings/ || true
+            cp input/02_Media_Coverage_and_Reviews/* input_u1/02_Media_Coverage_and_Reviews/ || true
+            cp input/03_User_Feedback_and_Complaints/* input_u1/03_User_Feedback_and_Complaints/ || true
+            cp input/04_Brand_Official_Sites/* input_u1/04_Brand_Official_Sites/ || true
+            ls -R input_u1 | head -20
+            # 用单用户目录重建镜像层（COPY input/ 指向的目录内容替换）
+            rm -rf input && mv input_u1 input
+            docker compose build agent 2>&1 | tail -2
+            docker compose run --rm agent sh -c "python /workspace/agent.py --prompt '请根据 /home/user/ws/input 中的数据完成消费决策任务，将结果输出到 /home/user/ws/output' && echo '--- 输出产物 ---' && ls -la /home/user/ws/output/ && for f in /home/user/ws/output/*.md; do echo \"== \$f ==\"; head -3 \"\$f\"; done && echo '--- agent.log 尾部 ---' && tail -10 /home/user/ws/logs/agent.log"
