@@ -1,33 +1,40 @@
-# qw-arena2 — 千问 AI Arena「消费决策好帮手：智能选购顾问」参赛资料
+# qw-arena2 —— 千问 AI Arena「智能选购顾问」参赛 Agent
 
-比赛相关信息已全部抓取并整理完毕。**主文档：[比赛完整资料.md](./比赛完整资料.md)**。
+> 接手文档 ｜ 任务卡见 [TASK.md](TASK.md) ｜ 项目原始自述见 [README-upstream.md](README-upstream.md)（原仓 README，含参赛背景与更多细节）
 
-## 比赛速览
+## 项目是什么
 
-- **任务**：构建端到端消费决策 Agent —— 读入用户描述 + 商品资料包（无线耳机品类，示例 6 用户 × 5 产品），一次运行产出 `user_profile.md`（用户画像）、`product_list.md`（产品属性）、`recommendation.md`（三选推荐）三份 Markdown。
-- **关键时间**：2026-10-23 提交截止（可反复提交，每天 ≤ 3 次）；机测 Top 30 进专家评审（10-23 ～ 10-31）；11 月初颁奖（金 1 / 银 2 / 铜 2）。
-- **打包**：`agent/` 目录 ZIP ≤ 100MB，入口 `agent.py|js|jar|agent` + `agent.json` + 依赖声明文件，依赖全部打进包（线上无网络，仅放行 `*.aliyuncs.com`），`--prompt` 传参，`--version` 必须支持，≤ 30 分钟 / 4GB。
-- **模型**：只能用平台规定列表（DashScope API / OpenAI 兼容），Key 从 `DASHSCOPE_API_KEY` 环境变量读。
-- **官方示例数据集 + 本地 Docker 验证工具**：见主文档第 8、9 节。
+阿里云「千问 AI Arena」平台赛 **消费决策好帮手：智能选购顾问** 的完整参赛仓（CompetitionId `37399010866182`）。agent 读入用户描述 + 商品资料包，产出三份 Markdown：`user_profile`（用户画像）/ `product_list`（产品清单）/ `recommendation`（推荐结论）。赛制：**2026-10-23 截止、每日 ≤3 发、平台保留历史最高分、机测 Top 30 进专家评审**。
 
-## 目录
+仓内包含：agent 本体与提示词、469 个测试、提交包打包链、提交协议逆向报告、本地评估器、判官咨询记录与全部迭代台账。
 
-| 路径 | 内容 |
-|---|---|
-| `比赛完整资料.md` | 全部比赛信息的结构化汇总（赛程/奖励/规范/评分细则/FAQ/排查清单/链接） |
-| `raw/pages/` | 各页面渲染后 HTML 存档（任务台 2 页 + 赛题页 4 标签 + Arena 首页 + FAQ 展开版） |
-| `raw/*.txt` | 上述页面的纯文本提取版 |
-| `raw/dataset_sample/` | 官方示例数据集（已解压） |
-| `raw/Agent本地验证指南.md` | 官方 Docker 本地验证工具说明全文 |
-| `tools/` | 本次抓取用的脚本（Edge Cookie 解密、会话构建、CDP 抓取） |
+## 架构一句话
 
-## 抓取方式备忘（2026-09-23）
+确定性管线：输入解析 → JSON Schema 结构化约束 → 逐字回溯 grounding（推荐结论必须引用产品清单原文）→ 零幻觉输出；配套「本地评估器当确定性裁判 + 平台出分回写台账」的双层验收。
 
-1. 页面需阿里云 SSO 登录。先用 VSS 卷影复制被锁的 Edge Cookies 库 + DPAPI 解密出登录态（`tools/decrypt_edge_cookies.py`，产物在 `.secrets/`，**敏感勿外传**），验证了免登录 API 通道；随后直接在内置浏览器登录，用浏览器自动化逐页抓取渲染后 DOM。
-2. 任务台为阿里云低代码搭建的 SPA，静态逆向（`raw/cup_dashboard.js` 等）无数据接口残留，改为渲染后抓取，内容完整。
+## 构建与运行
 
----
+- 环境：Python 3.11+，测试依赖 pytest（其余依赖见原仓 README 与 `config.example.json` 说明）。
+- 版本自检：`python agent/agent.py --version` → `0.5.2`
+- 全量测试：`python -m pytest tests -q -p no:cacheprovider`
+- e2e 双门：`python tools/e2e_mock.py`；`python tools/e2e_mock_packaged.py`（对 `dist/agent.zip` 实跑）
+- 本地评估器（真链需自备 `DASHSCOPE_API_KEY` 环境变量；离线指标不依赖它）：`python tools/local_eval.py` → 产出 `reports/local_eval/<run>/report.json`
+- 提交包：按仓内打包链生成 `dist/agent.zip`（赛规：ZIP ≤100MB、入口 `agent.py`+`agent.json`、必须支持 `--version`）
 
-## 仓库说明
+## 验收基线（2026-10-01 实测）
 
-本仓库自 agentic-factory-projects monorepo 拆分而来（一个项目一个仓库）；monorepo 内历史快照见原仓 feasy898/agentic-factory-projects。
+| 门 | 命令 | 基线 |
+|---|---|---|
+| G0-1 全量测试 | `python -m pytest tests -q` | **469 passed / 0 failed（约 30s）** |
+| G0-2 版本一致 | `python agent/agent.py --version` == dist 包内版本 | 0.5.2 == 0.5.2 |
+| G0-3 e2e | 两个 e2e 脚本 | exit 0 |
+| G0-4 本地评估三硬指标 | `tools/local_eval.py` 的 report.json | 结构 **6/6**、grounding **100%（570/570）**、幻觉 **0**（画像覆盖 0.6082 / 产品覆盖 0.5488 为诊断指标，不设阈值） |
+
+平台出分台账：`reports/submission_log.md`（每发提交一行：时间戳/包 sha256/流水号/状态/分数）。
+
+## 已知问题
+
+1. **无人值守提交通道未建**：唯一验证过的提交方式是平台页面人工提交（依赖人工登录态）；每日三发的人工依赖如何解除待决断（Temporal worker 方案或正式放弃无人值守，二选一）。
+2. **评分器自身随机（已实锤）**：同一包三发可得 8/6/2 不同分——单发分数无决策价值，唯一有效策略 = 当日最强包 ×3 采样，只信「历史最高分变化」这个外部真值。
+3. **真链本地评估不可跑**：需要 `DASHSCOPE_API_KEY`，该凭据不随仓分发，接手者需自备；无 key 时四项离线指标照常可跑。
+4. **分数台账矛盾待实查**：`submission_log` 一行记「历史最高 11 分」，另一处记「保留最高分为 2」——下次提交会话用平台 API（`ListMySubmissions`/`GetMyParticipation`）实查勘正。
