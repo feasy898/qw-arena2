@@ -25,3 +25,9 @@
 
 1. 页面需阿里云 SSO 登录。先用 VSS 卷影复制被锁的 Edge Cookies 库 + DPAPI 解密出登录态（`tools/decrypt_edge_cookies.py`，产物在 `.secrets/`，**敏感勿外传**），验证了免登录 API 通道；随后直接在内置浏览器登录，用浏览器自动化逐页抓取渲染后 DOM。
 2. 任务台为阿里云低代码搭建的 SPA，静态逆向（`raw/cup_dashboard.js` 等）无数据接口残留，改为渲染后抓取，内容完整。
+
+---
+
+## 仓库说明
+
+本仓库自 agentic-factory-projects monorepo 拆分而来（一个项目一个仓库）；monorepo 内历史快照见原仓 feasy898/agentic-factory-projects。
