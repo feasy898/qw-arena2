@@ -38,3 +38,9 @@
 2. **评分器自身随机（已实锤）**：同一包三发可得 8/6/2 不同分——单发分数无决策价值，唯一有效策略 = 当日最强包 ×3 采样，只信「历史最高分变化」这个外部真值。
 3. **真链本地评估不可跑**：需要 `DASHSCOPE_API_KEY`，该凭据不随仓分发，接手者需自备；无 key 时四项离线指标照常可跑。
 4. **分数台账矛盾待实查**：`submission_log` 一行记「历史最高 11 分」，另一处记「保留最高分为 2」——下次提交会话用平台 API（`ListMySubmissions`/`GetMyParticipation`）实查勘正。
+
+---
+
+## 仓库来源
+
+本仓库自 agentic-factory-projects monorepo 拆分而来（一个项目一个仓库）；monorepo 内历史快照见原仓 feasy898/agentic-factory-projects。
