@@ -64,7 +64,7 @@ def test_judge_u1_full_mode_perfect_score(judge_mod):
 
 
 def test_judge_catches_old_brand_conflict_in_degrade_snapshot(judge_mod):
-    """v0.5.2 旧产物：金标准层命中「规则9设备冲突」（Velmora 混入现有设备）。"""
+    """多阶段链产物快照：金标准层命中「规则9设备冲突」（已更换品牌混入现有设备）。"""
     res = judge_mod.judge(str(FIX_BASELINE / "degrade_chain_snapshot"), str(INPUT_DIR))
     assert res["mode"] == "full"
     assert res["total"] < 100.0

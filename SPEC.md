@@ -1,7 +1,6 @@
 # SPEC.md — 智能选购顾问 Agent 开发规格
 
-> 本文件是本项目的**唯一权威规格**，由比赛官方规则（`raw/competition-problemData.txt`）+ 外部专家咨询意见 + 项目决策共同构成。与官方规则冲突时，以官方规则原文为准并登记到 `reports/blockers.md`。
-> 阶段目标：**第一阶段（至 2026-09-25）交付可在 mock 模型下端到端跑通的基线**；真实模型联调与提交属第二阶段。
+> 本文件是本项目的**唯一权威规格**，依据比赛官方规则（`raw/competition-problemData.txt`）制定；与官方规则冲突时，以官方规则原文为准。
 
 ---
 
@@ -148,7 +147,7 @@ OutputBundle: user_profile_md, product_list_md, recommendation_md
 ## 12. 评估（本地 proxy，非官方）
 
 - 第一类 确定性验收：上节 10 项 + 资源限制，全部程序判定（tools/evaluate.py，结构失败退出码非 0）。
-- 第二类 真值事实评估：对示例数据构造部分真值夹具（第一阶段仅覆盖结构层面，真实质量待第二阶段真实模型）。
+- 第二类 真值事实评估：对示例数据构造部分真值夹具（当前覆盖结构层面）。
 - 第三类 专家代理评估：第二阶段再做。
 - 发布门槛（内部）：确定性测试全过；可满足用例三款全有效；关键事实精确率≥97%/召回≥95%（二阶段起测）；不越资源限制。
 
@@ -164,17 +163,7 @@ prompts/     profile_extraction.md product_extraction.md
 tests/       unit/ regression/ fixtures/
 tools/       evaluate.py e2e_mock.py package.py(二阶段)
 agent/       agent.py agent.json requirements.txt   ← 提交包（由 src 组装/引用）
-reports/     progress.md blockers.md e2e_sample_output/
+reports/     e2e_sample_output/（运行期生成，不入公开仓）
 ```
 
 模块签名以 `contracts/interfaces.md` 为准（契约阶段产出）。核心逻辑入口：`run(input_dir, output_dir, config) -> OutputBundle`，一次调用完成、不请求补充信息、不访问外部商品信息。
-
-## 14. 第一阶段验收标准（本次工作流）
-
-1. `python -m compileall src` 通过；
-2. `python -m pytest tests -q` 全通过；
-3. `python agent/agent.py --version` 输出 `0.1.0`、退出码 0；
-4. `python tools/e2e_mock.py`：以 mock 网关在 `raw/dataset_sample/Data_for_Users` 上端到端跑通，产出 3 份 md 且通过全部确定性校验，退出码 0；
-5. 独立审计无 high 级未修复问题。
-
-不在第一阶段范围：真实模型调用、真实平台沙箱运行、ZIP 打包、榜单提交、性能压测、真值质量评估。

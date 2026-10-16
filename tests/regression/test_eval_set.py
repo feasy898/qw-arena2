@@ -13,9 +13,8 @@ eval 集 = tests/fixtures/eval/：1 个 valid 夹具（评估应全过）+ inval
 - CLI 全量：每个 case 经 ``python tools/evaluate.py`` 子进程实跑一遍，
   valid=0 / invalid=1 逐案断言（退出码为证）。
 
-扩充批 13 案覆盖的失分场景类型与 3 条真实 badcase 的出处（submission_log 行号 /
-GROK_ASK5 / progress.md）见 EVAL_SET_CASES 各注释与 tests/fixtures/eval/README.md
-「2026-10-01 扩充批」一节。评估器与全部夹具均为确定性判定，不依赖模型/网关。
+扩充批 13 案覆盖的失分场景类型与 3 条真实缺陷形态见 EVAL_SET_CASES 各注释与
+tests/fixtures/eval/README.md。评估器与全部夹具均为确定性判定，不依赖模型/网关。
 """
 from __future__ import annotations
 
