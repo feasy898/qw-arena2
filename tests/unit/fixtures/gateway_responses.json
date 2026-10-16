@@ -1,0 +1,7 @@
+{
+  "unit_greeting": {"role": "assistant", "content": "{\"hello\": \"world\"}"},
+  "unit_profile_extraction": {"role": "assistant", "content": "{\"profile_id\": \"User_Description_1\", \"budget_max\": 800}"},
+  "unit_fenced_json": {"role": "assistant", "content": "```json\n{\"ok\": true}\n```"},
+  "unit_bad_json": {"role": "assistant", "content": "抱歉，我无法按 JSON 输出。"},
+  "unit_bad_format": {"role": "assistant"}
+}
