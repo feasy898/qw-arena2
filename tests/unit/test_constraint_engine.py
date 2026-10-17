@@ -358,3 +358,14 @@ class TestValidProductIds:
 
     def test_empty_constraints_empty_set(self):
         assert ce.valid_product_ids([]) == set()
+
+
+    def test_brand_avoid_case_insensitive(self):
+        """品牌排斥判定大小写不敏感：画像词元与货架品牌的大小写口径
+        不保证一致（如用户写 NovaPod、货架登记 novapod），不得因此漏排。"""
+        outcome, msg, _fact = ce._judge_brand_avoid(
+            {"canonical_id": "P001", "brand": "novapod"}, ["NovaPod"])
+        assert outcome is ce.ConstraintOutcome.FAIL
+        outcome, _msg, _fact = ce._judge_brand_avoid(
+            {"canonical_id": "P002", "brand": "Tasvin"}, ["NovaPod"])
+        assert outcome is ce.ConstraintOutcome.PASS

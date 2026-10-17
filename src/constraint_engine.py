@@ -739,7 +739,9 @@ def _judge_brand_avoid(product: dict, avoid: list[str]) -> tuple[ConstraintOutco
     pid = str(product.get("canonical_id"))
     cite = product_citation(pid, "brand")
     brand = text_of(product.get("brand")) or ""
-    hit = next((a for a in avoid if a and a in brand), None)
+    # 大小写不敏感：画像侧词元与产品注册侧品牌的大小写口径不保证一致
+    # （如用户写 NovaPod、货架登记 novapod），排斥判定不应因此漏排。
+    hit = next((a for a in avoid if a and a.casefold() in brand.casefold()), None)
     if hit:
         return (ConstraintOutcome.FAIL, f"品牌{brand}在用户排斥清单（{cite}＝{brand}）", "brand")
     return (ConstraintOutcome.PASS,

@@ -879,3 +879,24 @@ def test_p001_bluetooth_underwater_keeps_both_sides():
     assert drafts["P002"]["bluetooth_underwater"] == []
     assert drafts["P003"]["bluetooth_underwater"] == []
     assert drafts["P005"]["bluetooth_underwater"] == []
+
+
+def test_brand_avoidance_fallback_extraction():
+    """确定性路径的品牌排斥兜底抽取：brand_avoidances 是品牌排斥硬约束的
+    唯一来源，模型链不可用时也必须从「不想要/不要/排除」等句式抽出品牌词元。"""
+    from src.deterministic_extractor import _fill_preferences
+
+    profile = {}
+    _fill_preferences(profile, "我是一名程序员，不想要 NovaPod 品牌，也不要华为的耳机，排除 珂沐。偏好 Tasvin。")
+    assert profile["brand_avoidances"] == ["NovaPod", "华为", "珂沐"]
+    assert profile["brand_preferences"] == ["Tasvin"]
+
+    # 泛指词与形态词不进排斥清单（误收词元不会命中任何品牌文本，但保持画像干净）
+    profile = {}
+    _fill_preferences(profile, "我想要一副不太重的耳机，不想要太重的头戴式。")
+    assert profile["brand_avoidances"] == []
+
+    # 「的」切段：词元取品牌名而非粘连短语
+    profile = {}
+    _fill_preferences(profile, "不要华为的耳机。")
+    assert profile["brand_avoidances"] == ["华为"]

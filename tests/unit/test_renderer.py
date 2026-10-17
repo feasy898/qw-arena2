@@ -279,6 +279,18 @@ class TestRenderFactValue:
         )
         assert render_fact_value(cell) == "最长9小时（音量50%）"
 
+    def test_factcell_conditions_sanitized(self):
+        """条件注记可携带源数据原文（如货架「平台」单元格），其竖线/内嵌换行
+        必须消毒——否则破坏表格结构，渲染→回读往返失败。"""
+        cell = FactCell(
+            field_key="current_price", raw_value="299元", normalized_value=None,
+            fact_kind=FactKind.USER_FEEDBACK, status=FactStatus.SUPPORTED,
+            conditions=["电商平台甲|旗舰店", "渠道页\n旗舰店"],
+        )
+        text = render_fact_value(cell)
+        assert "|" not in text and "\n" not in text
+        assert "299元" in text and "电商平台甲／旗舰店" in text
+
     def test_factcell_missing_by_status(self):
         missing = FactCell(field_key="x", raw_value="", normalized_value=None, status=FactStatus.MISSING)
         assert render_fact_value(missing) == "未提供"

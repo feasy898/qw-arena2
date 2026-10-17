@@ -85,6 +85,11 @@ _DEVICE_RE = re.compile(
 )
 _CAMP_BRAND_RE = re.compile(r"阵营的([\u4e00-\u9fff]{2,8})")
 _PREFERENCE_BRAND_RE = re.compile(r"偏好\s*([^，。；\n]+)")
+# 品牌排斥句式（「不想要 NovaPod 品牌」「不要华为的耳机」「排除 X」）。
+# 画像的 brand_avoidances 是品牌排斥硬约束的唯一来源，确定性路径必须兜底抽取。
+_BRAND_AVOID_RE = re.compile(
+    r"(?:不想要|不要|不用|不买|不考虑|不喜欢|排除|拒绝|避开)\s*([^，。；\n]{1,40})"
+)
 _PREFERENCE_VERB_RE = re.compile(
     r"(?:希望|需要|要求|喜欢|不喜欢|不想)([^，。；\n]{2,40})"
 )
@@ -222,7 +227,9 @@ _ECOSYSTEM_PHRASES = (
     "封闭系统生态", "封闭系统", "安卓", "Android", "iOS", "苹果", "鸿蒙", "Windows",
 )
 _BRAND_STOP = frozenset({
-    "这类", "海外", "一线", "音频", "品牌", "的", "和", "与", "或", "等", "手机", "耳机",
+    "这类", "海外", "一线", "音频", "品牌", "牌子", "的", "和", "与", "或", "等", "手机", "耳机",
+    "太重", "太重了", "太贵", "大牌", "杂牌", "国产", "进口", "新款", "老款",
+    "头戴式", "入耳式", "半入耳", "骨传导", "颈挂式", "开放式", "耳挂式",
 })
 _PREF_STOP = frozenset({"一些", "一下", "功能", "产品", "耳机", "可以", "能够"})
 
@@ -815,6 +822,15 @@ def _fill_preferences(profile: dict, text: str) -> None:
             if token in _BRAND_STOP or token not in text:
                 continue
             _add_pref(buckets, text, "brand_preferences", token)
+    # 品牌排斥兜底：与 brand_preferences 同一套词元规则；词元先按「的」切段
+    # （「不要华为的耳机」取华为而非「华为的耳机」）；硬约束判定时按子串包含
+    # 匹配，误收的泛指词元（如「太重」）不会命中任何品牌文本。
+    for avoid_match in _BRAND_AVOID_RE.finditer(text):
+        for segment in re.split(r"的", avoid_match.group(1)):
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9]+|[\u4e00-\u9fff]{2,8}", segment):
+                if token in _BRAND_STOP or token not in text:
+                    continue
+                _add_pref(buckets, text, "brand_avoidances", token)
     clauses = []
     for match in _PREFERENCE_VERB_RE.finditer(text):
         clauses.append(match.group(0))

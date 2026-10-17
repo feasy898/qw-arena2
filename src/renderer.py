@@ -194,7 +194,9 @@ def _fact_cell_text(
         text = LIST_SEP.join(_scalar_text(item, None) for item in value)
     else:
         text = _scalar_text(value, unit)
-    cleaned = [str(c).strip() for c in (conditions or []) if str(c).strip()]
+    # 条件注记同样须过 _sanitize_cell：其内容可含源数据原文（如货架「平台」
+    # 单元格），未经消毒的竖线/内嵌换行会破坏表格结构，导致渲染→回读往返失败。
+    cleaned = [_sanitize_cell(str(c).strip()) for c in (conditions or []) if str(c).strip()]
     if cleaned:
         text = f"{text}（{LIST_SEP.join(cleaned)}）"
     return text

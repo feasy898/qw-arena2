@@ -144,9 +144,14 @@ def parse_recommendation(path):
     """recommendation.md → {recs, conclusion, unselected, bad_rows}。推荐表与未选原因表分开解析。"""
     text = open(path, encoding="utf-8").read()
     # 「未选原因」小节缺失时（退化输出）不再崩溃：tail 记空 → 规则5/规则6 出缺陷项。
-    # （原 judge 对此输入直接 ValueError；判定语义在原文档上逐字不变。）
-    parts = re.split(r"未选原因", text, maxsplit=1)
-    head, tail = (parts[0], "") if len(parts) == 1 else (parts[0], parts[1])
+    # 切分锚点优先取「未选原因」标题行（需求判断等正文若提前提及该词，
+    # 按首次出现切分会把推荐表错切进 tail）；无标题行时取最后一次出现。
+    heads = list(re.finditer(r"(?m)^#+\s*未选原因", text))
+    if heads:
+        head, tail = text[: heads[-1].start()], text[heads[-1].start():]
+    else:
+        idx = text.rfind("未选原因")
+        head, tail = (text, "") if idx < 0 else (text[:idx], text[idx:])
     rec_rows, bad1 = parse_md_table(head)
     unsel_rows, bad2 = parse_md_table(tail)
     conclusion = ""
@@ -396,7 +401,9 @@ def rule10_rec_ids_budget(rec, prods, budget, rec_text=""):
         if ok_id:
             row = next((x for x in prods[pid]["rows"] if x["field"].strip() == "当前售价"), None)
             price = _num(row["value"]) if row else None
-        ok_price = price is not None and cap is not None and price <= cap
+        # 预算缺失（cap=None）时不做超预算判定——无依据不指控，避免因 None
+        # 参与格式化/比较而崩溃，导致整道质检门经 fail-open 静默失效。
+        ok_price = cap is None or (price is not None and price <= cap)
         validity[pid] = ok_id and ok_price
         if not ok_id:
             out.append(Finding("规则10推荐ID", "R1", 0, f"推荐产品 {pid} 不存在于产品表"))
@@ -574,12 +581,20 @@ def _core(output_dir, input_dir, user_desc_path=None, golden=None):
     if fact_on:
         add(golden.preference_items(profile_rows))
 
-    # 规则10：R1 阶梯（预算取自画像「预算」字段数值）；「无」行按 §9 异常路径处理
+    # 规则10：R1 阶梯（预算取自画像「预算上限」字段数值）；「无」行按 §9 异常路径处理。
+    # 预算行选取与行序解耦：精确命中「预算上限」优先；兜底命中含「预算」的字段，
+    # 但排除「下限」（下限在前的行序会把 cap 压低，错杀合法推荐）。
     budget = None
     for r in profile_rows:
-        if "预算" in r["field"] and _num(r["value"]) is not None:
+        if r["field"].strip() == "预算上限" and _num(r["value"]) is not None:
             budget = _num(r["value"])
             break
+    if budget is None:
+        for r in profile_rows:
+            field = r["field"].strip()
+            if "预算" in field and "下限" not in field and _num(r["value"]) is not None:
+                budget = _num(r["value"])
+                break
     r10_findings, r1_ladder, validity = rule10_rec_ids_budget(
         rec, prods, budget, rec_text=rec.get("text", ""))
     add(r10_findings)

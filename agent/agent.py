@@ -50,7 +50,7 @@ _LIB = _HERE / "lib"  # 提交包布局：vendored 依赖目录（存在才加�
 if _LIB.is_dir() and str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 """--version 的兜底版本号（优先读 agent.json；须与 agent/agent.json 同步升级）。"""
 
 OUTPUT_FILENAMES = ("user_profile.md", "product_list.md", "recommendation.md")

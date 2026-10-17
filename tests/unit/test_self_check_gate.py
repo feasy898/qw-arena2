@@ -134,6 +134,57 @@ def test_self_check_run_atom_shape_and_doc_mapping(tmp_path):
                for a in res["failed_atoms"] if a["rule"] == "规则3画像字段组")
 
 
+def test_self_check_budget_missing_no_crash(tmp_path):
+    """画像无任何含数字的预算行时，规则10不做超预算判定（无依据不指控），
+    且不得因 None 参与格式化而崩溃——崩溃会被 fail-open 当通过，整道质检门静默失效。"""
+    docs = three_docs_passing().replace("| 预算 | 预算上限 | 2000元 |\n",
+                                        "| 预算 | 预算上限 | 未提供 |\n")
+    output_dir = tmp_path / "output"
+    advisor.write_outputs(str(output_dir), advisor.parse_three_docs(docs), profile_no="1")
+    res = sc.run(str(output_dir), str(_make_input(tmp_path)))
+    assert res["passed"] is True
+    assert all(a["rule"] != "规则10超预算" for a in res["failed_atoms"])
+
+
+def test_self_check_budget_line_order_independent(tmp_path):
+    """预算行选取与行序无关：预算下限行在前时仍以预算上限为准——
+    1845 元对下限 1500×1.1=1650 超、对上限 2000×1.1=2200 合法。"""
+    docs = three_docs_passing().replace(
+        "| 预算 | 预算上限 | 2000元 |\n",
+        "| 预算 | 预算下限 | 1500元 |\n| 预算 | 预算上限 | 2000元 |\n")
+    docs = docs.replace("| 购买与使用成本 | 当前售价 | 1498元 |",
+                        "| 购买与使用成本 | 当前售价 | 1845元 |")
+    output_dir = tmp_path / "output"
+    advisor.write_outputs(str(output_dir), advisor.parse_three_docs(docs), profile_no="1")
+    res = sc.run(str(output_dir), str(_make_input(tmp_path)))
+    assert res["passed"] is True
+    assert all(a["rule"] != "规则10超预算" for a in res["failed_atoms"])
+
+
+def test_parse_recommendation_anchors_on_exclusion_heading(tmp_path):
+    """推荐表与未选原因表的切分锚定「未选原因」标题行：
+    需求判断正文提前提及该词时推荐表不错位；无标题时取最后一次出现。"""
+    rec_md = tmp_path / "recommendation.md"
+    rec_md.write_text(
+        "# 消费推荐报告\n\n"
+        "需求判断：预算内可凑齐三款，未选原因见文末说明。\n\n"
+        "## 推荐结果\n\n"
+        "| 推荐层级 | 产品ID | 产品 | 画像匹配与推荐理由 | 注意事项 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| 首选 | P001 | 产品一 | 待核验 | 待核验 |\n"
+        "| 备选1 | P002 | 产品二 | 待核验 | 待核验 |\n"
+        "| 备选2 | P003 | 产品三 | 待核验 | 待核验 |\n\n"
+        "## 未选原因\n\n"
+        "| 产品ID | 未进入前三的主要原因 | 建议改变条件 |\n"
+        "| --- | --- | --- |\n"
+        "| P004 | 待核验 | 待核验 |\n\n"
+        "## 综合结论\n\n三款入选产品建议按画像优先级核验后决策。\n",
+        encoding="utf-8")
+    parsed = sc.parse_recommendation(str(rec_md))
+    assert [r["pid"] for r in parsed["recs"]] == ["P001", "P002", "P003"]
+    assert [r["pid"] for r in parsed["unselected"]] == ["P004"]
+
+
 def test_self_check_generalized_device_and_numbers():
     # 数值归一：28岁≡28、2000元左右≡2000；关键词包含：品类
     rows = [{"group": "基本情况", "field": "年龄", "value": "28岁"},
