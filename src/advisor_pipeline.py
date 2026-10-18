@@ -40,13 +40,18 @@ from pathlib import Path
 GEN_MODEL = "qwen3.8-max"
 FALLBACK_MODELS = ("qwen3.7-max", "deepseek-v4-pro", "kimi-k2.6", "qwen3.7-plus")
 """兜底默认选型；正常路径以 config.example.json「advisor」段为准（_advisor_models）。"""
-TIMEOUT_S = 1500  # 单次调用 socket 超时上限；实际逐次被进程死线钳制（见 run）
-# 进程级死线：requests 的 timeout 是逐 socket 操作口径，服务端挂起时单调用即可
-# 烧满 TIMEOUT_S；若候选链轮换不看总墙钟，平台 1800s 外部击杀时将无任何产物
-# 落盘、防线层也来不及执行。DEADLINE_S = 平台硬限 - 300s 降级链余量：每次发起
-# 调用前检查剩余预算，不足则直接移交多阶段降级链（其自带 BudgetManager）。
+TIMEOUT_S = 600  # 单次调用墙钟上限（timekeeper.call_with_wallclock 硬封顶）；
+# requests 的 socket timeout 是逐次读口径，慢流式响应可无限续命越过平台 1800s
+# 击杀线（2026-10-18「结果测评失败=agent运行超过限定时间」实证），故单调用一律
+# 改为墙钟口径；逐次再被进程死线钳制（见 run）。真链单次成功调用常见数十至
+# 数百秒，600s 上限只截断「注定拖死整场」的挂起调用。
 DEADLINE_S = 1500.0
-MIN_ATTEMPT_BUDGET_S = 120.0  # 剩余不足 RETRY_RESERVE_S+此值 时不再发起新调用
+# 进程级死线：与 src.timekeeper 全局死线（平台 1800s 硬限 − 300s 安全垫）取 min。
+# 若候选链轮换不看总墙钟，平台外部击杀时将无任何产物落盘、防线层也来不及执行；
+# 每次发起调用前检查剩余预算，不足则直接移交多阶段降级链（其预算同样锚定
+# timekeeper 进程起点，见 src.pipeline.run）。
+MIN_ATTEMPT_BUDGET_S = 120.0  # 剩余不足 FALLBACK_RESERVE_S+此值 时不再发起新调用
+FALLBACK_RESERVE_S = 150.0    # 移交接替降级链的最短余量（确定性链+写盘+镜像）
 
 # 限流退避：候选模型共享同一账号限流池，「429 即换模型」只会连环 429 烧尽
 # 候选链；对限流类状态码原地指数退避后再换。
@@ -58,11 +63,11 @@ _CHAT_BACKOFF_BASE_S = 5.0    # 5s → 10s（加亚秒级抖动）
 # 公开服务地址，非密钥。
 DEFAULT_OPENAI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-# 出厂质检重试的预算门限。进程死线（DEADLINE_S）已钳住总墙钟，且重试路径上
-# 「历史最优版已落盘」——降级链的 300s 余量只须在「无有效响应」路径保证
-# （候选循环的死线检查负责），重试路径不再需要；真链单次调用常见数百秒，
-# 门限过紧会让质检拦截到的缺陷失去重试修复的机会。
-RETRY_BUDGET_LIMIT_S = 1350.0
+# 出厂质检重试的预算门限（锚定 timekeeper 全局剩余，见 _retry_allowed）：
+# 重试路径上「历史最优版已落盘」，只需预留质检+写盘+镜像+交接开销（60s）与
+# 少量余量（30s）；剩余预算不足「上次调用耗时×放大系数+预留」时不重试，
+# 避免把整场拖过全局死线。
+RETRY_FINISH_RESERVE_S = 90.0
 RETRY_CALL_HEADROOM = 1.2    # 上次模型调用耗时的放大系数（估计下一次同量级）
 RETRY_RESERVE_S = 60.0       # 固定预留（质检+写盘+镜像+交接开销）
 
@@ -71,6 +76,13 @@ FILES = ("user_profile.md", "product_list.md", "recommendation.md")
 # 兄弟目录，REPO_ROOT = src/ 的父目录恒命中。
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _PROMPT_FILE = REPO_ROOT / "prompts" / "advisor_prompt.txt"
+
+# 全局时钟（进程级死线 + 调用墙钟）；不可用时退化为各调用点本地计时（旧行为），
+# 绝不让时间源故障阻断直出链。
+try:
+    from src import timekeeper
+except Exception:  # noqa: BLE001
+    timekeeper = None  # type: ignore[assignment]
 
 # 过程性措辞/模板残留 → 结论化表达（后处理硬卡；这类串会显著损伤产物可读性）
 _REWRITES = {
@@ -184,9 +196,11 @@ def _chat(key: str, base: str, model: str, user_msg: str,
     （prompt/completion/total），响应未携带 usage 块或缺数值键时为 None
     （遥测「如响应携带」口径，不影响正文语义）。
 
-    timeout_s：本次调用的 socket 超时（run 按进程死线逐次钳制后传入；
-    缺省 TIMEOUT_S）。deadline：进程死线（time.monotonic() 口径），退避等待
-    若越过死线则放弃重试直接抛错。
+    timeout_s：本次调用的 **墙钟** 上限（run 按进程死线逐次钳制后传入；
+    缺省 TIMEOUT_S）。实现经 src.timekeeper.call_with_wallclock：requests 的
+    socket timeout 是逐次读口径，慢流式响应可无限续命；墙钟到点即抛错换
+    下一候选，绝不让单次调用越过平台击杀线。deadline：进程死线
+    （time.monotonic() 口径），退避等待若越过死线则放弃重试直接抛错。
 
     采样参数：低 temperature + 固定 seed / top_p（降低逐次波动；OpenAI 兼容
     字段直传，网关不支持时按其兼容层语义忽略）。不发送 max_tokens——显式
@@ -208,10 +222,21 @@ def _chat(key: str, base: str, model: str, user_msg: str,
     timeout_s = TIMEOUT_S if timeout_s is None else timeout_s
     last_status: int | None = None
     for attempt in range(_CHAT_RETRY_MAX + 1):
-        r = requests.post(f"{base}/chat/completions",
-                          headers={"Authorization": f"Bearer {key}",
-                                   "Content-Type": "application/json"},
-                          json=body, timeout=timeout_s)
+        if timekeeper is not None:
+            try:
+                r = timekeeper.call_with_wallclock(
+                    requests.post, timeout_s,
+                    f"{base}/chat/completions",
+                    headers={"Authorization": f"Bearer {key}",
+                             "Content-Type": "application/json"},
+                    json=body, timeout=timeout_s)
+            except timekeeper.WallClockTimeout as exc:
+                raise RuntimeError(f"{model} {exc}") from exc
+        else:  # 时间源不可用：退化为纯 socket 超时（旧行为）
+            r = requests.post(f"{base}/chat/completions",
+                              headers={"Authorization": f"Bearer {key}",
+                                       "Content-Type": "application/json"},
+                              json=body, timeout=timeout_s)
         if r.status_code == 200:
             break
         last_status = r.status_code
@@ -362,11 +387,14 @@ def _log_gate_delivered(model: str, check: dict) -> None:
         pass
 
 
-def _retry_allowed(total_elapsed_s: float, last_call_s: float) -> bool:
-    """质检重试的预算门限：total_elapsed + 上次模型调用耗时×1.2 + 60 不超过
-    RETRY_BUDGET_LIMIT_S 才允许重试；进程死线另行钳制总墙钟。"""
-    return (total_elapsed_s + last_call_s * RETRY_CALL_HEADROOM
-            + RETRY_RESERVE_S) <= RETRY_BUDGET_LIMIT_S
+def _retry_allowed(remaining_s: float, last_call_s: float) -> bool:
+    """质检重试的预算门限：剩余预算须容下「上一次同量级调用 + 收尾预留」。
+
+    口径（0.7.6 起锚定 timekeeper 全局剩余，不再是绝对已耗时公式）：
+    remaining_s − 上次模型调用耗时×RETRY_CALL_HEADROOM ≥ RETRY_FINISH_RESERVE_S
+    才允许重试。重试路径上历史最优版已落盘，故只需预留收尾开销（质检+写盘+
+    镜像），无需为降级链再预留——重试本身永不 raise。"""
+    return (remaining_s - last_call_s * RETRY_CALL_HEADROOM) >= RETRY_FINISH_RESERVE_S
 
 
 def _self_check(output_dir: str, input_dir: str) -> dict | None:
@@ -408,7 +436,11 @@ def run(prompt_text: str) -> int:
     except Exception:  # noqa: BLE001
         format_failure_notice = None
     started = time.monotonic()
-    deadline = started + DEADLINE_S  # 进程死线：一切调用不得越过
+    # 进程死线：本地常量与 timekeeper 全局死线取 min（全局时钟 = 平台 1800s 硬限
+    # − 安全垫，自进程起点计时；timekeeper 不可用时退化为本地口径）。
+    deadline = started + DEADLINE_S
+    if timekeeper is not None:
+        deadline = min(deadline, timekeeper.deadline())
     request_count = 0
     tokens: dict[str, int] | None = None
     try:
@@ -444,16 +476,17 @@ def run(prompt_text: str) -> int:
     gate_failed: list[dict] = []  # 质检不过的候选版本（历史最优保留用）
     for model in (gen_model, *fallback_models):
         remaining = deadline - time.monotonic()
-        if remaining < RETRY_RESERVE_S + MIN_ATTEMPT_BUDGET_S:
+        if remaining < FALLBACK_RESERVE_S + MIN_ATTEMPT_BUDGET_S:
             last_err = RuntimeError(
-                f"进程死线临近（剩余 {remaining:.0f}s），不再发起调用，移交回退链")
+                f"进程死线临近（剩余 {remaining:.0f}s，需为降级链预留 "
+                f"{FALLBACK_RESERVE_S:.0f}s），不再发起调用，移交回退链")
             print(f"[advisor] {last_err}", file=sys.stderr)
             break
         try:
             request_count += 1  # 计 attempts：失败请求同样是一次真实调用
             t0 = time.monotonic()
             text, usage = _chat(key, base, model, user_msg,
-                                timeout_s=min(TIMEOUT_S, remaining - RETRY_RESERVE_S),
+                                timeout_s=min(TIMEOUT_S, remaining - FALLBACK_RESERVE_S),
                                 deadline=deadline)
             call_s = time.monotonic() - t0
             _accumulate(usage)
@@ -479,12 +512,12 @@ def run(prompt_text: str) -> int:
 
     # ---- 质检重试：恰好 1 次，仅 gen_model，预算门限内 ----
     best = min(gate_failed, key=lambda a: a["n_atoms"])
-    if _retry_allowed(time.monotonic() - started, best["call_s"]):
-        remaining = deadline - time.monotonic()
+    remaining = deadline - time.monotonic()
+    if _retry_allowed(remaining, best["call_s"]):
         notice = (format_failure_notice(best["check"]["failed_atoms"])
                   if format_failure_notice is not None else "")
         retry_msg = user_msg + "\n\n" + notice
-        if remaining < RETRY_RESERVE_S + MIN_ATTEMPT_BUDGET_S:
+        if remaining < RETRY_FINISH_RESERVE_S + MIN_ATTEMPT_BUDGET_S:
             print(f"[advisor] retry 跳过（死线临近，剩余 {remaining:.0f}s），"
                   f"保留历史最优版本", file=sys.stderr)
         else:

@@ -430,3 +430,21 @@ def test_run_aborts_near_deadline(tmp_path, monkeypatch):
         advisor.run(f"请根据 {input_dir} 中的数据完成消费决策任务，"
                     f"将结果输出到 {output_dir}")
     assert not called  # 一次调用都未发起
+
+
+def test_chat_wallclock_caps_trickling_call(monkeypatch):
+    """墙钟口径（0.7.6）：慢流式/挂起的调用在 timeout_s 到点即抛错换模型——
+    requests 的 socket 读超时被慢流式续命架空时，墙钟是唯一的真实上限。"""
+    import time as _time
+
+    class _FakeRequests:
+        @staticmethod
+        def post(url, headers=None, json=None, timeout=None):
+            _time.sleep(30)  # 慢流式挂起（socket 读超时永不生效的场景）
+            raise AssertionError("不应到达")
+
+    monkeypatch.setitem(sys.modules, "requests", _FakeRequests)
+    started = _time.monotonic()
+    with pytest.raises(RuntimeError, match="墙钟"):
+        advisor._chat("k", "https://example/v1", "m1", "msg", timeout_s=0.3)
+    assert _time.monotonic() - started < 5.0  # 按时截断，不陪跑

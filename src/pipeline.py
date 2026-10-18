@@ -79,7 +79,7 @@ from src.validators import validate_outputs
 
 PathLike = Union[str, os.PathLike]
 
-VERSION = "0.7.5"
+VERSION = "0.7.6"
 """与 agent/agent.json 的 version 保持一致（--version 输出它；见 resolve_version）。"""
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -421,6 +421,33 @@ def _nonempty_field_count(final: dict) -> int:
     return count
 
 
+def _new_budget(config: dict) -> BudgetManager:
+    """构造时间预算：钳到 timekeeper 全局时钟内（0.7.6 起）。
+
+    config 的 time_limits（soft 1680 / hard 1800）是平台契约口径的整场上限；
+    进程内一律以 timekeeper 全局预算（平台硬限 − 安全垫，自进程起点计时）为准：
+    hard = min(config.hard, 全局总预算 − 收尾预留)，soft = min(config.soft, hard−120)，
+    且起点 = timekeeper.start()——直出链已消耗的时间如实计入，降级链不再
+    新开口径的时钟（旧行为下「直出 1500s → 移交 → 降级链又开 1800s」总墙钟
+    可越过平台击杀线，产物未及落盘即「agent运行超过限定时间」）。
+    timekeeper 不可用时退化为 config 原样 + 本地起点（旧行为）。
+    """
+    try:
+        from src import timekeeper
+    except Exception:  # noqa: BLE001
+        return BudgetManager(config)
+    time_limits = config.get("time_limits") or {}
+    hard = min(float(time_limits.get("hard_seconds", 1800.0)),
+               max(60.0, timekeeper.total_s() - _PIPELINE_FINISH_RESERVE_S))
+    soft = min(float(time_limits.get("soft_seconds", 1680.0)),
+               max(30.0, hard - 120.0))
+    clamped = dict(config, time_limits={"hard_seconds": hard, "soft_seconds": soft})
+    return BudgetManager(clamped, start_monotonic=timekeeper.start())
+
+
+_PIPELINE_FINISH_RESERVE_S = 30.0  # 收尾预留（末轮写盘 + 镜像 + 防线交接）
+
+
 def run(input_dir: PathLike, output_dir: PathLike, config: dict) -> OutputBundle:
     """一次调用完成端到端主链（不请求补充信息、不访问外部商品信息）。
 
@@ -441,7 +468,7 @@ def run(input_dir: PathLike, output_dir: PathLike, config: dict) -> OutputBundle
     """
     logger = _ensure_logging(config)
     started = time.monotonic()
-    budget = BudgetManager(config)
+    budget = _new_budget(config)
     gateway: Optional[ModelGateway] = None
     gateway_error: Optional[Exception] = None
     try:

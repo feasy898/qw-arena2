@@ -14,6 +14,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -386,14 +388,32 @@ def test_run_gate_delivered_best_logs_failure_list_to_agent_log(tmp_path, monkey
 
 
 def test_retry_allowed_budget_formula():
-    # total_elapsed + 上次调用×1.2 + 60 ≤ RETRY_BUDGET_LIMIT_S（进程死线已钳
-    # 总墙钟，重试路径历史最优版已落盘）
-    assert advisor._retry_allowed(0.0, 0.0) is True
-    assert advisor._retry_allowed(1000.0, 70.0) is True    # 1000+84+60=1144 ≤ 1350
-    assert advisor._retry_allowed(1290.0, 0.0) is True     # 边界 1350 ≤ 1350
-    assert advisor._retry_allowed(1290.1, 0.0) is False
-    assert advisor._retry_allowed(0.0, 1075.0) is True     # 0+1290+60=1350 ≤ 1350
-    assert advisor._retry_allowed(0.0, 1076.0) is False    # 0+1291.2+60=1351.2 > 1350
+    # remaining − 上次调用×1.2 ≥ RETRY_FINISH_RESERVE_S（90s；锚定 timekeeper
+    # 全局剩余，重试路径历史最优版已落盘，只需预留收尾开销）
+    assert advisor._retry_allowed(1000.0, 0.0) is True
+    assert advisor._retry_allowed(1000.0, 700.0) is True    # 1000−840=160 ≥ 90
+    assert advisor._retry_allowed(90.0, 0.0) is True        # 边界 90 ≥ 90
+    assert advisor._retry_allowed(89.9, 0.0) is False
+    assert advisor._retry_allowed(150.0, 50.0) is True      # 150−60=90 ≥ 90
+    assert advisor._retry_allowed(149.9, 50.0) is False     # 149.9−60=89.9 < 90
+    assert advisor._retry_allowed(500.0, 400.0) is False    # 500−480=20 < 90
+
+
+def test_run_aborts_when_global_budget_exhausted(tmp_path, monkeypatch):
+    """死线锚定 timekeeper 全局时钟：全局预算不足「降级链预留+单次调用下限」
+    时，一次调用都不发起，抛错移交回退链（0.7.6 起不再只看本地 DEADLINE_S）。"""
+    input_dir = _make_input(tmp_path)
+    output_dir = tmp_path / "output"
+    _del_log_env(monkeypatch)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    from src import timekeeper
+    timekeeper.init(total_s=120.0)  # < FALLBACK_RESERVE_S(150)+MIN_ATTEMPT_BUDGET_S(120)
+    called: list[str] = []
+    monkeypatch.setattr(advisor, "_chat",
+                        lambda *a, **k: called.append("x") or ("", None))
+    with pytest.raises(RuntimeError, match="死线临近|全部候选模型失败"):
+        advisor.run(f"请根据 {input_dir} 中的数据完成任务，输出到 {output_dir}")
+    assert not called
 
 
 def test_run_gate_fail_open_when_self_check_unavailable(tmp_path, monkeypatch):

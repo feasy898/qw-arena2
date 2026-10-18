@@ -560,3 +560,43 @@ def test_probe_all_fail_keeps_default(monkeypatch):
     out = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
     assert out["content"] == "fine"
     assert len(fake.calls) > 8  # 探测多发 + 正式调用
+
+
+# ---------- 墙钟封顶（0.7.6：慢流式续命封堵） ----------
+
+def test_chat_real_wallclock_caps_trickling_post(monkeypatch):
+    """慢流式/挂起的请求被墙钟截断：socket 读超时被续命架空时，墙钟按时把
+    该次调用归入「网络异常」重试路径（重试用尽 → GatewayError），不陪跑。"""
+    import time as _time
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
+    monkeypatch.setenv("OPENAI_BASE_URL", OPENAI_BASE_URL)
+    config = base_config(max_retries_per_request=0, request_timeout_seconds=1)
+    gateway = ModelGateway(config)
+
+    class _HungSession:
+        def post(self, url, headers=None, json=None, timeout=None):
+            _time.sleep(30)  # 慢流式挂起：socket 读超时永不生效的场景
+            raise AssertionError("不应到达")
+
+    gateway._session = _HungSession()
+    gateway._sleep = lambda s: None
+    started = _time.monotonic()
+    with pytest.raises(GatewayError, match="重试用尽"):
+        gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert _time.monotonic() - started < 15.0  # 墙钟 1s+余量，截断不陪跑
+
+
+def test_probe_skipped_when_soft_remaining_tight(monkeypatch):
+    """探测矩阵预算钳制：软剩余 <45s 时整体跳过探测（不消耗 FakeSession，
+    不挤占确定性产出的收尾窗口），首调用走既有回退逻辑。"""
+    import time as _time
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-unit-test-fake")
+    monkeypatch.setenv("OPENAI_BASE_URL", OPENAI_BASE_URL)
+    config = base_config(gateway_probe=True)
+    budget = BudgetManager(config, start_monotonic=_time.monotonic() - 1660)
+    gateway = ModelGateway(config, budget=budget)
+    fake = FakeSession([ok_response("ok")])
+    gateway._session = fake
+    result = gateway.chat([{"role": "user", "content": "hi"}], "qwen3.6-plus")
+    assert result["content"] == "ok"
+    assert len(fake.calls) == 1  # 探测被跳过：仅真实调用这一发

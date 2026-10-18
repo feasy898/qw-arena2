@@ -39,6 +39,7 @@ from typing import Any, Optional
 import requests
 
 from src.budget_manager import BudgetManager, estimate_messages_tokens, estimate_tokens
+from src import timekeeper
 
 logger = logging.getLogger("qw.model_gateway")
 
@@ -50,6 +51,15 @@ PLATFORM_CONTRACT_PATH = REPO_ROOT / "contracts" / "platform_contract.json"
 DEFAULT_MOCK_FIXTURE_PATH = "tests/fixtures/gateway/responses.json"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 RETRY_BACKOFF_BASE_SECONDS = 1.0
+
+# 单次请求的墙钟封顶余量：requests 的 timeout 是逐 socket 读口径，慢流式响应
+# （字节间隔小于读超时）可无限续命、越过平台 1800s 击杀线（2026-10-18 平台
+# 「agent运行超过限定时间」实证）；墙钟 = socket 超时 + 本余量，正常路径仍由
+# socket 超时先触发（异常类型/重试语义不变），墙钟只截慢流式续命。
+_WALLCLOCK_SLACK_S = 5.0
+# 探测矩阵的预算纪律：软剩余不足时跳过探测（预算紧张时 60s 探测会挤占
+# 确定性产出的收尾窗口）；充足时探测总预算 = min(60s, 软剩余×0.5)。
+_PROBE_MIN_SOFT_REMAINING_S = 45.0
 
 # 可重试状态码：429 限流、408 超时、网关类 5xx（501 Not Implemented 不重试）
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
@@ -481,8 +491,13 @@ class ModelGateway:
             timeout = self._request_timeout()
             started = time.monotonic()
             try:
-                response = self._session.post(url, headers=headers,
-                                              json=payload, timeout=timeout)
+                try:
+                    response = timekeeper.call_with_wallclock(
+                        self._session.post, timeout + _WALLCLOCK_SLACK_S,
+                        url, headers=headers, json=payload, timeout=timeout)
+                except timekeeper.WallClockTimeout as exc:
+                    # 慢流式续命被墙钟截断 → 归入「网络异常」既有重试/换址逻辑
+                    raise requests.Timeout(str(exc)) from exc
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_error = f"网络异常 {type(exc).__name__}"
                 logger.warning("chat attempt=%d model=%s %s（url=%s）",
@@ -691,7 +706,7 @@ class ModelGateway:
         探测成功 → 锁定 URL/模型/（若最小形态成功则永久抑制附加参数）；
         全失败 → 保持默认组合，由首调用的既有回退逻辑与上层降级链兜底。
         探测请求 max_tokens=1（token 消耗可忽略，不计入 usage 记账），
-        单请求超时 12s、总预算 60s。
+        单请求超时 12s、总预算 min(60s, 软剩余×0.5)（软剩余 <45s 时整体跳过）。
         """
         if self._endpoint_probed or self._mock:
             return
@@ -704,7 +719,14 @@ class ModelGateway:
         urls = self._base_url_candidates()
         models = [m for m in [self._config.get("default_model")] + self._fallback_models
                   if m and m in self._whitelist]
-        deadline = time.monotonic() + 60.0
+        # 预算钳制：软剩余不足时跳过探测（如直出链烧尽后移交降级链的场景，
+        # 60s 探测会挤占确定性产出的收尾窗口）；充足时总预算 min(60s, 软剩余×0.5)。
+        soft_remaining = self._budget.soft_remaining_seconds()
+        if soft_remaining < _PROBE_MIN_SOFT_REMAINING_S:
+            logger.info("软剩余 %.0fs 不足 %.0fs，跳过探测矩阵（保持默认组合，"
+                        "首调用走既有回退逻辑）", soft_remaining, _PROBE_MIN_SOFT_REMAINING_S)
+            return
+        deadline = time.monotonic() + min(60.0, max(10.0, soft_remaining * 0.5))
         for url in urls:
             key_invalid = False
             for model in models:

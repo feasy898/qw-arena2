@@ -50,7 +50,15 @@ _LIB = _HERE / "lib"  # 提交包布局：vendored 依赖目录（存在才加�
 if _LIB.is_dir() and str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 
-VERSION = "0.7.5"
+# 全局时钟（src.timekeeper，纯标准库）：t0 ≈ 进程启动，直出链/降级链/网关共用
+# 同一进程级死线（平台 1800s 硬限 − 安全垫）。import 失败不致命——防线层照常，
+# 各阶段退化为各自本地预算（旧行为），绝不让时间源故障导致非零退出。
+try:
+    from src import timekeeper as _timekeeper  # noqa: E402
+except BaseException:  # noqa: BLE001
+    _timekeeper = None
+
+VERSION = "0.7.6"
 """--version 的兜底版本号（优先读 agent.json；须与 agent/agent.json 同步升级）。"""
 
 OUTPUT_FILENAMES = ("user_profile.md", "product_list.md", "recommendation.md")
@@ -313,6 +321,12 @@ def _fallback_output(prompt_text: str, exc: BaseException) -> NoReturn:
 # ---------------------------------------------------------------------------
 
 def _run(argv: Optional[list[str]] = None) -> NoReturn:
+    # 全局时钟初始化（--version 之前）：t0 已在 import 时定格，此处只按 env 收紧预算
+    if _timekeeper is not None:
+        try:
+            _timekeeper.init_from_env()
+        except Exception:  # noqa: BLE001  时间源故障不阻断任何路径
+            pass
     # --version 在一切之前处理（含 src 损坏场景：绝不先 import 再判版本）
     try:
         args, unknown = _parse_args(argv)
